@@ -1,0 +1,55 @@
+[project]
+name = "keystone"
+version = "0.1.0"
+description = "Zero-standing-privilege credential broker: GitHub Actions OIDC -> AWS STS, OPA-authorized, hash-chain audited."
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+  "pydantic>=2.13,<3",
+  "sqlalchemy>=2.0.54,<3",
+  "alembic>=1.20,<2",
+  "psycopg[binary]>=3.3,<4",
+  "rfc8785>=0.1.4,<0.2",
+  "cryptography>=50,<51",
+]
+
+[project.scripts]
+keystone = "keystone_cli.main:main"
+keystone-policy-verify = "keystone.authz.policy_verify.main:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "mypy>=1.14",
+  "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["keystone", "cli/keystone_cli"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+packages = ["keystone", "keystone_cli", "tests"]
+mypy_path = "cli"
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires KEYSTONE_TEST_DATABASE_URL (PostgreSQL in Docker)", "policy: requires the opa binary"]

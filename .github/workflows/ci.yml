@@ -1,0 +1,34 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: keystone_admin
+          POSTGRES_PASSWORD: keystone_test
+          POSTGRES_DB: keystone_test
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U keystone_admin -d keystone_test"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest -q
+        env:
+          KEYSTONE_TEST_DATABASE_URL: postgresql+psycopg://keystone_admin:keystone_test@localhost:55432/keystone_test

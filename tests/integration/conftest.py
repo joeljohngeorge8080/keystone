@@ -4,12 +4,16 @@ import os
 from collections.abc import Iterator
 
 import pytest
+import redis
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from keystone.db.redis import make_redis
+
 DATABASE_URL_ENV = "KEYSTONE_TEST_DATABASE_URL"
+REDIS_URL_ENV = "KEYSTONE_TEST_REDIS_URL"
 APP_LOGIN_ROLE = "keystone_app_login"
 APP_LOGIN_PASSWORD = "app-test-only"  # throwaway local test credential
 
@@ -54,3 +58,15 @@ def app_engine(admin_engine: Engine) -> Iterator[Engine]:
     engine = create_engine(url)
     yield engine
     engine.dispose()
+
+
+@pytest.fixture
+def redis_client() -> Iterator[redis.Redis]:
+    url = os.environ.get(REDIS_URL_ENV)
+    if not url:
+        pytest.skip(f"{REDIS_URL_ENV} not set; start deploy/compose.test.yml")
+    client = make_redis(url, timeout_seconds=1.0)
+    client.flushdb()
+    yield client
+    client.flushdb()
+    client.close()

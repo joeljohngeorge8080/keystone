@@ -15,6 +15,7 @@ class EventType(enum.StrEnum):
     AUTH_FAILED = "auth_failed"
     TOKEN_REPLAYED = "token_replayed"  # noqa: S105 — event label, not a secret
     RATE_LIMITED = "rate_limited"
+    PRE_AUTH_SHED = "pre_auth_shed"
     DECISION_DENIED = "decision_denied"
     DECISION_ALLOWED = "decision_allowed"
     CREDENTIAL_ISSUED = "credential_issued"

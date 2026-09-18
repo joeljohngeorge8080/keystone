@@ -1,0 +1,62 @@
+# Policy-bundle pipeline (spec Ch. 20, R2, R8): the structural validator is a REQUIRED stage;
+# signing only runs after it passes, and OPA rejects unsigned bundles at load (Ch. 21).
+name: policy-bundle
+on:
+  push:
+    branches: [main]
+    paths: ["policies/**", "keystone/authz/policy_verify/**", ".github/workflows/policy-bundle.yml"]
+  pull_request:
+    paths: ["policies/**", "keystone/authz/policy_verify/**", ".github/workflows/policy-bundle.yml"]
+
+permissions:
+  contents: read
+  id-token: write  # Cosign keyless signing
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install
+      - run: uv sync --locked
+      - run: opa fmt --fail --list policies
+      - run: opa check --strict policies
+      - run: opa test --coverage --threshold 100 policies
+      - name: keystone-policy-verify (required, non-skippable)
+        run: uv run keystone-policy-verify policies
+
+  build-and-sign:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+      - uses: sigstore/cosign-installer@v3
+      - name: Stamp CI-assigned bundle_sequence into the manifest (R8 — never author-supplied)
+        run: |
+          python3 - <<'PY'
+          import json, os
+          path = "policies/.manifest"
+          manifest = json.load(open(path))
+          manifest["revision"] = os.environ["GITHUB_SHA"]
+          manifest.setdefault("metadata", {})["bundle_sequence"] = int(os.environ["GITHUB_RUN_NUMBER"])
+          json.dump(manifest, open(path, "w"), indent=2)
+          PY
+      - run: opa build -b policies --ignore '*_test.rego' -o keystone-policy-bundle.tar.gz
+      - run: sha256sum keystone-policy-bundle.tar.gz | tee keystone-policy-bundle.sha256
+      - name: Cosign keyless sign (only reachable after validate succeeded)
+        run: cosign sign-blob --yes --bundle keystone-policy-bundle.cosign keystone-policy-bundle.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keystone-policy-bundle-${{ github.run_number }}
+          path: |
+            keystone-policy-bundle.tar.gz
+            keystone-policy-bundle.sha256
+            keystone-policy-bundle.cosign

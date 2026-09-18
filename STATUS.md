@@ -1,6 +1,6 @@
 # STATUS.md — implementation progress against HANDOFF phases
 
-Updated 2026-09-18. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINAL.md`.
+Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINAL.md`.
 
 ## Phase 1 — Audit chain (R1) — DONE, VERIFIED
 - [x] `audit_events` (month-partitioned, append-only via grants + trigger), `audit_chain_head`
@@ -69,6 +69,49 @@ Updated 2026-09-18. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
 - [ ] `POST /v1/credentials` and the OIDC verification stage that produces IdentityContext (Phase 4/5)
 - [ ] `updated_at` maintenance is app-side; no DB trigger
 
-## Phase 4 — OPA + rate limiting + worker isolation — not started
-## Phase 5 — Reconcilers + API/CLI — not started
-## Phase 6 — Invariant test suite — not started
+## Phase 4 — OPA + rate limiting + worker isolation — DONE (core), VERIFIED
+- [x] Replay protection: SET NX PX on sha256(jti), TTL covers exp + skew (Ch. 30, AMB-2, F11)
+- [x] Rate limiting R3: Tier 0 global shedding (not IP-keyed), Tier 1 per-identity/per-repo with
+      registry overrides, Tier 2 STS in-flight cap; one atomic Lua bucket; Redis down = 503
+- [x] Aggregation R4: bounded cardinality + overflow bucket + HyperLogLog estimate, one chained
+      row per bucket, at-least-once flush; aggregation client can point at its own Redis
+- [x] OIDC verification (Ch. 17/31) + three-tier JWKS cache (Ch. 18) with the forgery suite
+- [x] Authorization stage (Ch. 19, F3, F7): OPA sidecar evaluator, strict decision schema,
+      explainability, per-request digest vs pin (503 POLICY_PIN_DIVERGENCE), audited before use
+- [x] Two-phase pin activation (R5) + CI-assigned monotonic sequence (R8): OPA polls a
+      Keystone-served, OPA-signed bundle; pin commits only after OPA confirms; forced rollback
+      loudly audited; content-digest revision proven against bundle contents
+- [x] Anchoring (Ch. 32/33, A8): Ed25519-signed anchors chained to each other, external
+      write-once store written before the DB row commits; S3 Object Lock COMPLIANCE store
+- [x] Scheduled verification (F9/R7): snapshot head, closed range, anchor signature + linkage
+      checks, pages on divergence; breaker trips only on anchor-store unreachability
+- [x] Celery topology (Ch. 9/R7): `keystone-anchor` queue isolated from `keystone-worker`
+
+### Deliberately NOT done in Phase 4
+- [ ] OPA capabilities file disabling non-deterministic builtins (Ch. 19)
+- [ ] Bundle-server endpoint on the admin plane (StagedBundleStore exists; HTTP route is Phase 5)
+- [ ] policy-bundle.yml still builds with `opa build -b policies` + Cosign; switch to
+      `build_signed_bundle` (content-digest revision, OPA signing key from CI secrets)
+- [ ] Redis `noeviction` for primary and a separate `allkeys-lru` instance for aggregation are
+      documented, not yet expressed in compose/Terraform
+- [ ] Retention pruning (DROP PARTITION only behind an anchor) and JWKS/aggregation task wiring
+      have bodies but no end-to-end worker run
+- [ ] S3 conditional put (`IfNoneMatch: *`) is on by default but only moto-tested without it
+
+## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, API/CLI not started
+- [x] Issuance reconciler (R6): one transaction per row, `indeterminate` until the 20 min
+      CloudTrail window passes, `issued_undelivered` when a session is found, never rewrites
+- [x] Revocation (Ch. 26, F6): flagged -> IAM deny policy -> read-back confirm -> applied;
+      mechanism 3 OFF by default renders the runbook policy; reverse-crash backfill
+- [ ] `POST /v1/credentials` request pipeline (Tier 0 -> verify -> Tier 1 -> authorize -> issue
+      -> single-shot response -> mark delivered), admin plane, error envelope (Ch. 39-43)
+- [ ] Admin bearer-token auth, `/readyz` with pin-divergence + breaker signals
+- [ ] CLI admin commands (`roles`, `policy pin/status`, `decisions`, `revoke role`, `replay`)
+- [ ] Dashboard (Ch. 44), GitHub Action (Ch. 46), metrics (Ch. 51), Docker/compose, Terraform
+
+## Phase 6 — Invariant test suite — partial
+- [x] Named tests exist for: fail-closed on PostgreSQL/Redis/OPA/JWKS outage, canonical-payload,
+      structural policy validation, double-allowlist DB half, audit-before-mint, revocation
+      ordering, replay, rate limiting, pin ordering, reconciler atomicity, worker isolation,
+      anchor tamper detection
+- [ ] Ch. 27 failure-table coverage as one matrix; mutation testing; performance budgets (Ch. 61)

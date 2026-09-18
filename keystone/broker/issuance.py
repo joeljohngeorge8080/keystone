@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import text
@@ -59,16 +59,19 @@ class Issuance(BaseModel):
     granted_ttl_seconds: int = Field(ge=900, le=3600)
     expires_at: datetime | None
     identity_claims: dict[str, JsonValue]
+    created_at: datetime
 
 
-_COLUMNS = (
+_INSERT_COLUMNS = (
     "id, jti_hash, target_role_id, policy_pin_id, state, grant_name, session_name, "
     "session_policy_ref, access_key_prefix, granted_ttl_seconds, expires_at, identity_claims"
 )
+_COLUMNS = _INSERT_COLUMNS + ", created_at"
 _INSERT = text(
-    f"INSERT INTO issuances ({_COLUMNS}) VALUES (:id, :jti_hash, :target_role_id, "  # noqa: S608
+    f"INSERT INTO issuances ({_INSERT_COLUMNS}) VALUES (:id, :jti_hash, :target_role_id, "  # noqa: S608
     ":policy_pin_id, :state, :grant_name, :session_name, :session_policy_ref, "
-    ":access_key_prefix, :granted_ttl_seconds, :expires_at, CAST(:identity_claims AS jsonb))"
+    ":access_key_prefix, :granted_ttl_seconds, :expires_at, CAST(:identity_claims AS jsonb)) "
+    "RETURNING created_at"
 )
 _GET = text(f"SELECT {_COLUMNS} FROM issuances WHERE id = :id")  # noqa: S608
 _TRANSITION = text(
@@ -108,6 +111,7 @@ class IssuanceRepository:
     ) -> Issuance:
         issuance = Issuance(
             id=uuid7(),
+            created_at=datetime.now(UTC),  # replaced by the database's clock on insert
             jti_hash=jti_hash,
             target_role_id=target_role_id,
             policy_pin_id=policy_pin_id,
@@ -120,11 +124,11 @@ class IssuanceRepository:
             expires_at=None,
             identity_claims=identity_claims,
         )
-        params = issuance.model_dump()
+        params = issuance.model_dump(exclude={"created_at"})
         params["state"] = issuance.state.value
         params["identity_claims"] = json.dumps(identity_claims, separators=(",", ":"))
-        self._conn.execute(_INSERT, params)
-        return issuance
+        created_at = self._conn.execute(_INSERT, params).scalar_one()
+        return issuance.model_copy(update={"created_at": created_at})
 
     def get(self, issuance_id: uuid.UUID) -> Issuance | None:
         row = self._conn.execute(_GET, {"id": issuance_id}).one_or_none()

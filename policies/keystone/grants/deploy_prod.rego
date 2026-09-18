@@ -14,8 +14,8 @@ allow if {
 	input.identity.ref == "refs/heads/main"
 	is_string(input.identity.event_name)
 	input.identity.event_name in {"push", "workflow_dispatch"}
-	is_boolean(input.identity.is_fork)
-	input.identity.is_fork == false
+	is_string(input.identity.repository_id)
+	input.identity.repository_id == "42"
 }
 
 ttl_cap_seconds := 900

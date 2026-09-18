@@ -127,6 +127,7 @@ class JwksCache:
         self._clock = clock
         self._sleep = sleep
         self._local: _InProcess | None = None
+        self._forcing = False
         self.origin_fetches = 0
         self.served_stale = False
 
@@ -158,7 +159,11 @@ class JwksCache:
         now = self._now()
         if not force_refresh and self._local and self._local.expires_at > now:
             return self._local.keys
-        raw = self._redis_tier(now, force_refresh=force_refresh)
+        self._forcing = force_refresh
+        try:
+            raw = self._redis_tier(now, force_refresh=force_refresh)
+        finally:
+            self._forcing = False
         keys = parse_jwks(raw)
         self._local = _InProcess(keys=keys, expires_at=now + IN_PROCESS_TTL_SECONDS)
         return keys
@@ -186,6 +191,11 @@ class JwksCache:
         if not locked:
             return self._wait_for_other_fetcher(now)
         try:
+            # Double-check: a fetch may have completed between our cache miss and taking the lock.
+            cached = cast(bytes | None, guarded(lambda: self._redis.get(_RAW_KEY)))
+            until_raw = cast(bytes | None, guarded(lambda: self._redis.get(_FRESH_UNTIL_KEY)))
+            if cached is not None and until_raw and float(until_raw) > now and not self._forcing:
+                return cached
             raw = self._source.fetch()
             parse_jwks(raw)  # invalid documents never overwrite a valid cache
             self.origin_fetches += 1

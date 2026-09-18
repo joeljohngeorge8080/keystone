@@ -9,6 +9,13 @@ matched contains name if {
 	grants[name].allow == true
 }
 
+# The digest OPA actually has loaded (F7): recorded as policy_digest and compared to the DB pin.
+loaded_bundle_digest := digest if {
+	revisions := [r | some name; r := data.system.bundles[name].manifest.revision]
+	count(revisions) == 1
+	digest := revisions[0]
+} else := "unloaded"
+
 decision := {
 	"allow": true,
 	"grant": name,
@@ -17,6 +24,7 @@ decision := {
 	"rule_path": sprintf("keystone.grants.%s", [name]),
 	"deny_reasons": [],
 	"obligations": grants[name].obligations,
+	"loaded_bundle_digest": loaded_bundle_digest,
 } if {
 	count(matched) == 1
 	some name in matched
@@ -30,6 +38,7 @@ decision := {
 	"rule_path": null,
 	"deny_reasons": ["NO_GRANT_MATCHED"],
 	"obligations": {},
+	"loaded_bundle_digest": loaded_bundle_digest,
 } if {
 	count(matched) == 0
 }
@@ -42,6 +51,7 @@ decision := {
 	"rule_path": null,
 	"deny_reasons": ["AMBIGUOUS_GRANT"],
 	"obligations": {},
+	"loaded_bundle_digest": loaded_bundle_digest,
 } if {
 	count(matched) > 1
 }

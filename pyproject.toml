@@ -11,6 +11,7 @@ dependencies = [
   "psycopg[binary]>=3.3,<4",
   "rfc8785>=0.1.4,<0.2",
   "cryptography>=50,<51",
+  "boto3>=1.43,<2",
 ]
 
 [project.scripts]
@@ -22,6 +23,7 @@ dev = [
   "pytest>=8",
   "mypy>=1.14",
   "ruff>=0.9",
+  "moto>=5.2,<6",
 ]
 
 [build-system]
@@ -40,7 +42,7 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF"]
 ignore = ["S101"]  # assert is fine in tests
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "B"]
+"tests/**" = ["S", "B", "E501"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -49,6 +51,10 @@ warn_unreachable = true
 packages = ["keystone", "keystone_cli", "tests"]
 mypy_path = "cli"
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*", "moto.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

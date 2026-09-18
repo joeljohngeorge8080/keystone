@@ -50,15 +50,15 @@ def _normalize_key(key: str) -> str:
     return key.replace("_", "").replace("-", "").lower()
 
 
-def _assert_no_forbidden_keys(value: JsonValue, path: str) -> None:
+def assert_no_forbidden_keys(value: JsonValue, path: str = "") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if _normalize_key(key) in {_normalize_key(k) for k in FORBIDDEN_DATA_KEYS}:
                 raise ValueError(f"forbidden key {key!r} at {path or '$'}")
-            _assert_no_forbidden_keys(child, f"{path}.{key}")
+            assert_no_forbidden_keys(child, f"{path}.{key}")
     elif isinstance(value, list):
         for i, child in enumerate(value):
-            _assert_no_forbidden_keys(child, f"{path}[{i}]")
+            assert_no_forbidden_keys(child, f"{path}[{i}]")
 
 
 def format_rfc3339(moment: datetime) -> str:
@@ -88,7 +88,7 @@ class AuditEventInput(BaseModel):
     @field_validator("data")
     @classmethod
     def _no_secret_material(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        _assert_no_forbidden_keys(value, "")
+        assert_no_forbidden_keys(value)
         return value
 
 

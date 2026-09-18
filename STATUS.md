@@ -42,7 +42,33 @@ Updated 2026-09-18. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
 - [ ] Validator treats `deny*`-named rules as exempt only when never used as an allow condition;
       negation inside presence guards (`not is_null`) is not special-cased — authors use `is_*`
 
-## Phase 3 — DB schema + AWS STS broker — not started
+## Phase 3 — DB schema + AWS STS broker — DONE (core), VERIFIED
+- [x] Migration 0002: target_roles, session_policy_templates (inline policy <= 2048), policy_pins
+      (one active, CI-assigned bundle_sequence), admin_principals/admin_tokens (90-day cap),
+      issuances (state enum, jti_hash + session_name unique, TTL 900-3600), rate_limit_overrides,
+      audit_anchors (append-only), audit_events.issuance_id FK; least-privilege grants
+- [x] RoleRegistry (DB half of the double allowlist; disabled/unknown role and template refused)
+- [x] TTL clamp lattice (Ch. 25): floor/ceiling/policy-cap/registry-max, strict deny mode
+- [x] CredentialConnector Protocol + AwsStsConnector: region-pinned, botocore retries OFF,
+      Throttling retried once, timeout after send = indeterminate (never blind-retried),
+      AccessDenied 502 / MalformedPolicyDocument 500 / unreachable 503, Expiration ~ now+ttl check,
+      closed attribution-tag set, redacted repr
+- [x] Issuance state machine + repository (AMB-3: denials write no row; idempotent by state)
+- [x] IssuanceService: T1 authorize row committed before mint, mint outside any transaction,
+      T2 audit + state in one transaction; refusals audited in their own transaction;
+      session_name = ks-{repository_id}-{run_id}-{decision_seq} (AMB-4)
+- [x] Settings (Ch. 47): env > defaults, unknown KEYSTONE_* keys refuse boot
+
+### Deliberately NOT done in Phase 3
+- [ ] Revocation mechanisms 2-4 (Ch. 26 / F6 ordering, `keystone revoke role`) — Phase 5
+- [ ] Policy-pin repository + two-phase activation (R5) and admin-token auth — Phase 4/5
+- [ ] Startup issuance reconciler (R6) that resolves AUTHORIZED/INDETERMINATE rows — Phase 5
+- [ ] Terraform modules (Ch. 64): broker-runtime IAM allowlist, target-role trust policy — the IAM
+      half of the double allowlist exists only as a contract right now
+- [ ] STS verified against moto + botocore Stubber only; no nightly sandbox-AWS run yet (Ch. 59)
+- [ ] `POST /v1/credentials` and the OIDC verification stage that produces IdentityContext (Phase 4/5)
+- [ ] `updated_at` maintenance is app-side; no DB trigger
+
 ## Phase 4 — OPA + rate limiting + worker isolation — not started
 ## Phase 5 — Reconcilers + API/CLI — not started
 ## Phase 6 — Invariant test suite — not started

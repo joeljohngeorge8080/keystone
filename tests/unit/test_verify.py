@@ -60,9 +60,22 @@ def test_deleted_middle_event_is_seq_gap() -> None:
 def test_deleted_tail_is_head_mismatch() -> None:
     events, head = build_chain(5)
     result = verify_chain(events[:3], expected_head=head)
+    assert result.ok is False
     assert result.finding is not None
     assert result.finding.code == FindingCode.HEAD_MISMATCH
     assert result.events_verified == 3
+
+
+def test_head_with_the_right_seq_but_a_forged_hash_is_head_mismatch() -> None:
+    # Every event verifies, but the pinned head claims a different chain: the snapshot head is
+    # the anchor for "nothing after this was rewritten", so its hash must be checked too.
+    events, head = build_chain(4)
+    forged = ChainHead(seq=head.seq, head_hash=bytes(32))
+    result = verify_chain(events, expected_head=forged)
+    assert result.ok is False
+    assert result.finding is not None
+    assert (result.finding.code, result.finding.seq) == (FindingCode.HEAD_MISMATCH, 4)
+    assert result.events_verified == 4
 
 
 def test_reordered_events_with_renumbered_columns_are_caught() -> None:
@@ -109,3 +122,17 @@ def test_unparseable_canonical_is_reported_not_crashed() -> None:
     result = verify_chain(events, expected_head=head)
     assert result.finding is not None
     assert result.finding.code == FindingCode.CANONICAL_UNPARSEABLE
+
+
+def test_valid_json_that_is_not_an_object_is_reported_not_crashed() -> None:
+    events, _ = build_chain(2)
+    for payload in (b"[1,2]", b'"text"', b"42", b"null"):
+        forged = replace(
+            events[1],
+            canonical_payload=payload,
+            event_hash=compute_event_hash(events[0].event_hash, payload),
+        )
+        result = verify_chain([events[0], forged])
+        assert result.ok is False
+        assert result.finding is not None
+        assert (result.finding.code, result.finding.seq) == (FindingCode.CANONICAL_UNPARSEABLE, 2)

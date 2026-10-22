@@ -14,6 +14,10 @@ from keystone.audit.verify import json_equal
         ({"n": [1e30, {"m": 0.002}]}, {"n": [10**30, {"m": 0.002}]}),
         (None, None),
         ("x", "x"),
+        (True, True),
+        (False, False),
+        ([], []),
+        ({}, {}),
     ],
 )
 def test_same_number_different_python_type_is_equal(a: JsonValue, b: JsonValue) -> None:
@@ -33,6 +37,14 @@ def test_same_number_different_python_type_is_equal(a: JsonValue, b: JsonValue) 
         ({"a": 1}, {"a": 1, "b": 2}),
         ({"a": 1}, {"b": 1}),
         (None, 0),
+        # Containers against other types answer False instead of raising (R1: a tampered
+        # `details` of the wrong shape is a divergence finding, never a verifier crash).
+        ({"a": 1}, "a"),
+        ("a", {"a": 1}),
+        ({"a": 1}, [["a", 1]]),
+        ([1], "1"),
+        ("ab", ["a", "b"]),
+        ([1], {"0": 1}),
     ],
 )
 def test_different_values_are_not_equal(a: JsonValue, b: JsonValue) -> None:

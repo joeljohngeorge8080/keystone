@@ -38,3 +38,5 @@ jobs:
         env:
           KEYSTONE_TEST_DATABASE_URL: postgresql+psycopg://keystone_admin:keystone_test@localhost:55432/keystone_test
           KEYSTONE_TEST_REDIS_URL: redis://localhost:56379/0
+      # Spec Ch. 57: mutation testing on the chain and verifier; survivors are test gaps.
+      - run: uv run python -m tests.mutation.run

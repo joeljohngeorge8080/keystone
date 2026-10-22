@@ -37,6 +37,20 @@ _INSERT_ROLE = text(
 _SET_ROLE_ENABLED = text(
     "UPDATE target_roles SET enabled = :enabled, updated_at = now() WHERE name = :name"
 )
+_LIST_ROLES = text(f"SELECT {_ROLE_COLUMNS} FROM target_roles ORDER BY name")  # noqa: S608
+# COALESCE keeps every column the patch leaves as NULL; no SQL is assembled from input.
+_UPDATE_ROLE = text(
+    "UPDATE target_roles SET "  # noqa: S608 — constant column list, bound values only
+    "max_ttl_seconds = COALESCE(:max_ttl_seconds, max_ttl_seconds), "
+    "enabled = COALESCE(:enabled, enabled), "
+    "description = COALESCE(:description, description), "
+    "owner = COALESCE(:owner, owner), updated_at = now() "
+    f"WHERE name = :name RETURNING {_ROLE_COLUMNS}"
+)
+_LIST_TEMPLATES = text(
+    "SELECT id, target_role_id, ref, policy_document, enabled FROM session_policy_templates "
+    "WHERE target_role_id = :role_id ORDER BY ref"
+)
 _GET_TEMPLATE = text(
     "SELECT id, target_role_id, ref, policy_document, enabled FROM session_policy_templates "
     "WHERE target_role_id = :role_id AND ref = :ref"
@@ -100,6 +114,38 @@ class RoleRegistry:
         )
         self._conn.execute(_INSERT_ROLE, role.model_dump())
         return role
+
+    def list_roles(self) -> list[TargetRole]:
+        return [TargetRole(**row._mapping) for row in self._conn.execute(_LIST_ROLES)]
+
+    def update_role(
+        self,
+        name: str,
+        *,
+        max_ttl_seconds: int | None = None,
+        enabled: bool | None = None,
+        description: str | None = None,
+        owner: str | None = None,
+    ) -> TargetRole:
+        """Patch mutable fields. `role_arn` is deliberately not patchable: re-pointing an
+        approved grant at a different AWS role must be a new, separately reviewed role."""
+        row = self._conn.execute(
+            _UPDATE_ROLE,
+            {
+                "name": name,
+                "max_ttl_seconds": max_ttl_seconds,
+                "enabled": enabled,
+                "description": description,
+                "owner": owner,
+            },
+        ).one_or_none()
+        if row is None:
+            raise RegistryError(RegistryCode.ROLE_UNKNOWN, f"role {name!r} not found")
+        return TargetRole(**row._mapping)
+
+    def list_templates(self, role_id: uuid.UUID) -> list[SessionPolicyTemplate]:
+        rows = self._conn.execute(_LIST_TEMPLATES, {"role_id": role_id})
+        return [SessionPolicyTemplate(**row._mapping) for row in rows]
 
     def set_role_enabled(self, name: str, enabled: bool) -> None:
         if self._conn.execute(_SET_ROLE_ENABLED, {"name": name, "enabled": enabled}).rowcount != 1:

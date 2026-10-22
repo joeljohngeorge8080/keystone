@@ -26,10 +26,12 @@ from keystone.broker.connectors.base import (
     TemplateError,
     UnavailableError,
 )
+from keystone.broker.revocation import RevocationUnconfirmed
 from keystone.broker.service import PolicyRegistryDivergence, TtlDenied
 from keystone.db.redis import DependencyUnavailable
 from keystone.identity.jwks import JwksUnavailable
 from keystone.identity.oidc import TokenRejected
+from keystone.registry.admin import RegistryConflict, RegistryInvalid
 from keystone.registry.repo import RegistryError
 
 
@@ -89,6 +91,9 @@ KNOWN_ERRORS: tuple[type[Exception], ...] = (
     BundleError,
     PinSequenceRejected,
     PolicyLoadTimeout,
+    RegistryConflict,
+    RegistryInvalid,
+    RevocationUnconfirmed,
 )
 
 
@@ -146,6 +151,12 @@ def map_exception(exc: Exception) -> ApiError:
             return ApiError(409, exc.code, str(exc), False)
         case PolicyLoadTimeout():
             return ApiError(409, exc.code, str(exc), True)
+        case RegistryConflict() | RegistryInvalid():
+            return ApiError(exc.http_status, exc.code, str(exc), False)
+        case RevocationUnconfirmed():
+            # The deny policy may be on the role; the reconciler backfills revocation_applied once
+            # IAM reads it back. Re-submitting would only flag a second revocation.
+            return ApiError(502, "REVOCATION_UNCONFIRMED", str(exc), False)
         case _:
             raise TypeError(f"no API mapping for {type(exc).__name__}")
 

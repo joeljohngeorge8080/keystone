@@ -22,7 +22,7 @@ from sqlalchemy.engine import Connection, Engine
 from keystone.audit.events import AuditEventInput, EventType
 from keystone.audit.sink import AuditSink
 from keystone.db.ids import uuid7
-from keystone.registry.repo import RoleRegistry
+from keystone.registry.repo import RegistryCode, RegistryError, RoleRegistry
 
 POLICY_NAME_PREFIX = "keystone-revoke-before-"
 
@@ -142,11 +142,22 @@ class RevocationService:
         self._applier = applier
         self._clock = clock
 
-    def revoke_role(self, role_name: str, *, not_before: datetime, actor: str) -> RevocationResult:
+    def revoke_role(
+        self,
+        role_name: str,
+        *,
+        not_before: datetime,
+        actor: str,
+        admin_principal_id: uuid.UUID | None = None,
+    ) -> RevocationResult:
         rendered = render_deny_policy(not_before)
         # T1: flag first. If we crash after this, the reconciler finds an open flag.
         with self._engine.begin() as conn:
-            role = RoleRegistry(conn).require_enabled_role(role_name)
+            # Any registered role, enabled or not: Ch. 26 escalates from disabling the grant (2)
+            # to invalidating its live sessions (3), so a disabled role must stay revocable.
+            role = RoleRegistry(conn).get_role(role_name)
+            if role is None:
+                raise RegistryError(RegistryCode.ROLE_UNKNOWN, f"role {role_name!r} not found")
             revocation_id = uuid7()
             mechanism = "iam_deny_policy"
             try:
@@ -170,6 +181,7 @@ class RevocationService:
                 role.name,
                 not_before,
                 {"revocation_id": str(revocation_id)},
+                admin_principal_id,
             )
 
         # Apply (mechanism 3) — outside any DB transaction.
@@ -189,7 +201,9 @@ class RevocationService:
             raise RevocationUnconfirmed(f"deny policy {policy_name} not read back on {role.name}")
 
         # T2: only after confirmation does the chain claim enforcement.
-        self._mark_applied(revocation_id, role.name, not_before, policy_name, actor)
+        self._mark_applied(
+            revocation_id, role.name, not_before, policy_name, actor, admin_principal_id
+        )
         return RevocationResult(revocation_id, role.name, not_before, True, policy_name, rendered)
 
     def reconcile_open(self) -> int:
@@ -213,6 +227,7 @@ class RevocationService:
         not_before: datetime,
         policy_name: str,
         actor: str,
+        admin_principal_id: uuid.UUID | None = None,
     ) -> None:
         with self._engine.begin() as conn:
             updated = conn.execute(
@@ -232,6 +247,7 @@ class RevocationService:
                     "policy_name": policy_name,
                     "confirmed": True,
                 },
+                admin_principal_id,
             )
 
     def _append(
@@ -242,6 +258,7 @@ class RevocationService:
         role_name: str,
         not_before: datetime,
         extra: dict[str, JsonValue],
+        admin_principal_id: uuid.UUID | None = None,
     ) -> None:
         self._audit.append(
             conn,
@@ -249,6 +266,7 @@ class RevocationService:
                 event_type=event_type,
                 occurred_at=self._clock(),
                 actor=actor,
+                admin_principal_id=admin_principal_id,
                 data={
                     "role": role_name,
                     "not_before": not_before.astimezone(UTC).isoformat(),

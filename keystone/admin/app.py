@@ -15,22 +15,22 @@ import hmac
 import logging
 import os
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, timedelta
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Query, Request
+import boto3
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
 from starlette.concurrency import run_in_threadpool
 
+from keystone.admin import audit_routes, registry_routes
+from keystone.admin.deps import Admin, AdminServices, bearer
 from keystone.admin.readiness import ReadinessProbe
 from keystone.admin.tokens import (
     PRINCIPAL_PATTERN,
     AdminAuthFailed,
-    AdminPrincipal,
     AdminTokenRecord,
     AdminTokenService,
 )
@@ -46,16 +46,19 @@ from keystone.api.http import (
 from keystone.audit.anchor import AnchorBreaker
 from keystone.audit.sink import PostgresAuditSink
 from keystone.authz.pins import (
-    BundleGateway,
     OpaBundleGateway,
     PinActivator,
     PolicyPinRepository,
     StagedBundleStore,
 )
 from keystone.authz.service import active_pin
+from keystone.broker.connectors.aws_sts import AwsStsConnector
+from keystone.broker.revocation import IamDenyPolicyApplier, RevocationService
 from keystone.config.settings import Settings
 from keystone.db.redis import make_redis
 from keystone.identity.jwks import HttpJwksSource, JwksCache
+from keystone.registry.admin import RegistryAdmin
+from keystone.registry.repo import RegistryCode, RegistryError
 
 MAX_JSON_BYTES = 32 * 1024
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -63,28 +66,11 @@ BUNDLE_PATH = "/bundles/keystone.tar.gz"
 _log = logging.getLogger("keystone.admin")
 
 
-@dataclass(frozen=True, slots=True)
-class AdminServices:
-    engine: Engine
-    tokens: AdminTokenService
-    readiness: ReadinessProbe
-    pins: PinActivator
-    gateway: BundleGateway
-    bundles: StagedBundleStore
-    bundle_service_token: str | None
-
-
 class IssueTokenRequest(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
 
     principal: str = Field(pattern=PRINCIPAL_PATTERN)
     ttl_days: int = Field(default=30, ge=1, le=90)
-
-
-def _bearer(request: Request) -> str | None:
-    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
-    credential = credential.strip()
-    return credential if scheme.lower() == "bearer" and credential else None
 
 
 def _token_json(record: AdminTokenRecord) -> dict[str, JsonValue]:
@@ -97,22 +83,29 @@ def _token_json(record: AdminTokenRecord) -> dict[str, JsonValue]:
     }
 
 
-def require_admin(request: Request) -> AdminPrincipal:
-    token = _bearer(request)
-    if token is None:
-        raise AdminAuthFailed("missing bearer token")
-    services: AdminServices = request.app.state.services
-    return services.tokens.authenticate(token)
-
-
-# Module level on purpose: with postponed annotations FastAPI resolves this name via globals.
-Admin = Annotated[AdminPrincipal, Depends(require_admin)]
+# On the admin plane an unknown role/template is a plain 404 and a disabled one a 409; the
+# public plane maps the same exception to 500 POLICY_REGISTRY_DIVERGENCE (Ch. 19).
+_REGISTRY_STATUS = {
+    RegistryCode.ROLE_UNKNOWN: 404,
+    RegistryCode.TEMPLATE_UNKNOWN: 404,
+    RegistryCode.ROLE_DISABLED: 409,
+    RegistryCode.TEMPLATE_DISABLED: 409,
+}
 
 
 def create_admin_app(services: AdminServices) -> FastAPI:
     app = FastAPI(title="Keystone admin", docs_url=None, redoc_url=None, openapi_url=None)
     install_common(app, _log, map_known_errors=True)
     app.state.services = services
+    app.include_router(registry_routes.router)
+    app.include_router(audit_routes.router)
+
+    async def registry_error(request: Request, exc: Exception) -> JSONResponse:
+        assert isinstance(exc, RegistryError)
+        error = ApiError(_REGISTRY_STATUS[exc.code], exc.code.value, str(exc), False)
+        return error_response(error, request_id_of(request))
+
+    app.add_exception_handler(RegistryError, registry_error)
 
     @app.get("/readyz")
     def readyz() -> JSONResponse:
@@ -219,7 +212,7 @@ def create_admin_app(services: AdminServices) -> FastAPI:
 
     @app.get(BUNDLE_PATH)
     def serve_bundle(request: Request) -> Response:
-        presented = _bearer(request)
+        presented = bearer(request)
         if expected_digest is None or presented is None:
             raise AdminAuthFailed("bundle service token required")
         # Compare fixed-length digests so neither length nor content leaks through timing.
@@ -257,6 +250,17 @@ def build_admin(settings: Settings) -> AdminServices:
         bundle_service_token=settings.bundle_service_token.get_secret_value()
         if settings.bundle_service_token
         else None,
+        registry=RegistryAdmin(
+            engine, sink, AwsStsConnector(region=settings.aws_region).validate_registration
+        ),
+        revocations=RevocationService(
+            engine,
+            sink,
+            IamDenyPolicyApplier(
+                boto3.client("iam", region_name=settings.aws_region),
+                enabled=settings.revocation_put_role_policy_enabled,
+            ),
+        ),
     )
 
 

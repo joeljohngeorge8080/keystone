@@ -80,6 +80,12 @@ _TRANSITION = text(
     "expires_at = COALESCE(:expires_at, expires_at), updated_at = now() "
     "WHERE id = :id AND state = :from_state"
 )
+_PAGE = text(
+    f"SELECT {_COLUMNS} FROM issuances "  # noqa: S608 — constant columns
+    "WHERE (CAST(:before AS uuid) IS NULL OR id < :before) "
+    "AND (CAST(:state AS text) IS NULL OR state = :state) "
+    "ORDER BY id DESC LIMIT :limit"
+)
 _NON_TERMINAL = text(
     f"SELECT {_COLUMNS} FROM issuances "  # noqa: S608
     "WHERE state IN ('authorized', 'issued', 'indeterminate') ORDER BY created_at"
@@ -157,6 +163,13 @@ class IssuanceRepository:
         )
         if result.rowcount != 1:
             raise IllegalTransition(f"issuance {issuance_id} is not in state {from_state}")
+
+    def page(
+        self, *, before: uuid.UUID | None, limit: int, state: IssuanceState | None = None
+    ) -> list[Issuance]:
+        """Newest first; ids are UUIDv7, so `id < before` is a stable time-ordered keyset."""
+        params = {"before": before, "limit": limit, "state": state.value if state else None}
+        return [_row_to_issuance(row) for row in self._conn.execute(_PAGE, params)]
 
     def non_terminal(self) -> list[Issuance]:
         return [_row_to_issuance(row) for row in self._conn.execute(_NON_TERMINAL)]

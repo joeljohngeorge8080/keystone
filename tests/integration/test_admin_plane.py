@@ -20,7 +20,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from keystone.admin.app import BUNDLE_PATH, AdminServices, build_admin, create_admin_app
+from keystone.admin.app import BUNDLE_PATH, build_admin, create_admin_app
+from keystone.admin.deps import AdminServices
 from keystone.admin.tokens import BOOTSTRAP_PRINCIPAL
 from keystone.audit.events import EventType
 from keystone.audit.store import load_events, snapshot_head

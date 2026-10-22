@@ -110,17 +110,24 @@ def test_unconfirmed_never_claims_applied_and_reconciler_backfills(
     assert service.reconcile_open() == 0  # idempotent
 
 
-def test_unknown_or_disabled_role_is_refused_before_flagging(
-    app_engine: Engine, role: None
-) -> None:
+def test_unknown_role_is_refused_before_flagging(app_engine: Engine, role: None) -> None:
     service = RevocationService(app_engine, PostgresAuditSink(), FakeApplier(enabled=True))
     with pytest.raises(RegistryError):
         service.revoke_role("nope", not_before=NOT_BEFORE, actor="a")
+    assert _types(app_engine) == []
+
+
+def test_disabled_role_can_still_be_revoked(app_engine: Engine, role: None) -> None:
+    # Ch. 26 escalation order: disable the grant (2) first, then invalidate live sessions (3).
     with app_engine.begin() as conn:
         RoleRegistry(conn).set_role_enabled("deploy-prod", False)
-    with pytest.raises(RegistryError):
-        service.revoke_role("deploy-prod", not_before=NOT_BEFORE, actor="a")
-    assert _types(app_engine) == []
+    service = RevocationService(app_engine, PostgresAuditSink(), FakeApplier(enabled=True))
+    result = service.revoke_role("deploy-prod", not_before=NOT_BEFORE, actor="a")
+    assert result.applied is True
+    assert _types(app_engine) == [
+        EventType.REVOCATION_FLAGGED.value,
+        EventType.REVOCATION_APPLIED.value,
+    ]
 
 
 def test_iam_applier_request_shape_and_read_back() -> None:

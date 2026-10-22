@@ -98,7 +98,7 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       have bodies but no end-to-end worker run
 - [ ] S3 conditional put (`IfNoneMatch: *`) is on by default but only moto-tested without it
 
-## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, public API DONE, admin plane partial
+## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, public API DONE, admin plane DONE
 - [x] Issuance reconciler (R6): one transaction per row, `indeterminate` until the 20 min
       CloudTrail window passes, `issued_undelivered` when a session is found, never rewrites
 - [x] Revocation (Ch. 26, F6): flagged -> IAM deny policy -> read-back confirm -> applied;
@@ -114,8 +114,15 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       OPA loaded digest vs pin, anchor breaker, JWKS fresh-or-grace; unauthenticated, states
       only); `GET|POST /v1/policy/pins`, `GET /v1/policy/status`; bundle route for the OPA
       sidecar behind KEYSTONE_BUNDLE_SERVICE_TOKEN (`opa_config_yaml(bearer_token_path=...)`)
-- [ ] Admin plane slice 2: roles + session-policy templates, `POST /v1/revocations`,
-      `/v1/decisions/{id}`, `/v1/audit/events`, `/v1/audit/verify`, `/v1/issuances`
+- [x] Admin plane slice 2: `GET|POST /v1/roles`, `GET|PATCH /v1/roles/{name}` (role_arn not
+      patchable), `GET|POST /v1/roles/{name}/session-policies` (Statement + STS size checked), all
+      audited as `admin_role_changed` with the acting principal; `POST /v1/revocations` (any
+      registered role, enabled or not, per Ch. 26 escalation; not_before never in the future);
+      `GET /v1/decisions/{id}` (decision + outcome events), `GET /v1/audit/events` (keyset,
+      event_type filter), `GET /v1/audit/verify` (snapshot head, 100k events per call),
+      `GET /v1/issuances` (UUIDv7 keyset, state filter). Events render from `canonical_payload`.
+- [ ] Decision lookup scans `details->'data'->>'decision_id'` with an occurred_at bound derived
+      from the UUIDv7 (partition pruning) but no expression index; add one by migration if slow
 - [ ] Rate-limit overrides from `rate_limit_overrides` (Tier1Limiter runs on defaults; note the
       table's scopes are `repository|role` while the limiter asks for `identity|repository`),
       trusted proxy handling for `source_ip`, structured JSON logging (Ch. 49), `/readyz` clock

@@ -50,6 +50,7 @@ from keystone.authz.pins import (
     PinActivator,
     PolicyPinRepository,
     StagedBundleStore,
+    restage_active_bundle,
 )
 from keystone.authz.service import active_pin
 from keystone.broker.connectors.aws_sts import AwsStsConnector
@@ -59,6 +60,8 @@ from keystone.db.redis import make_redis
 from keystone.identity.jwks import HttpJwksSource, JwksCache
 from keystone.registry.admin import RegistryAdmin
 from keystone.registry.repo import RegistryCode, RegistryError
+from keystone.telemetry.clock import clock_sync_state
+from keystone.telemetry.logs import configure_logging
 
 MAX_JSON_BYTES = 32 * 1024
 MAX_BUNDLE_BYTES = 16 * 1024 * 1024
@@ -242,7 +245,12 @@ def build_admin(settings: Settings) -> AdminServices:
         engine=engine,
         tokens=AdminTokenService(engine, sink),
         readiness=ReadinessProbe(
-            engine, primary, gateway, JwksCache(primary, HttpJwksSource(settings.jwks_url)), breaker
+            engine,
+            primary,
+            gateway,
+            JwksCache(primary, HttpJwksSource(settings.jwks_url)),
+            breaker,
+            clock_sync=clock_sync_state if settings.clock_sync_check else None,
         ),
         pins=PinActivator(engine, sink, gateway),
         gateway=gateway,
@@ -265,8 +273,11 @@ def build_admin(settings: Settings) -> AdminServices:
 
 
 def admin_app_from_env() -> FastAPI:
+    configure_logging("admin")
     settings = Settings.from_env(os.environ)
     services = build_admin(settings)
+    if restage_active_bundle(services.engine, services.bundles) is None:
+        _log.warning("no persisted bundle for the active pin; OPA polls 404 until the next pin")
     if settings.admin_bootstrap_token is not None:
         record = services.tokens.bootstrap(settings.admin_bootstrap_token.get_secret_value())
         if record is not None:

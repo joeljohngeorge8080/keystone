@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,9 @@ from sqlalchemy.engine import Engine
 
 from keystone.admin.app import BUNDLE_PATH, build_admin, create_admin_app
 from keystone.admin.deps import AdminServices
+from keystone.admin.readiness import ReadinessProbe
 from keystone.admin.tokens import BOOTSTRAP_PRINCIPAL
+from keystone.audit.anchor import AnchorBreaker
 from keystone.audit.events import EventType
 from keystone.audit.store import load_events, snapshot_head
 from keystone.audit.verify import verify_chain
@@ -49,6 +52,7 @@ def _settings(engine: Engine, client: redis.Redis, opa_port: int) -> Settings:
         opa_url=f"http://127.0.0.1:{opa_port}",
         admin_bootstrap_token=BOOTSTRAP,
         bundle_service_token=BUNDLE_TOKEN,
+        clock_sync_check=False,  # host-dependent; covered with an injected signal below
     )
 
 
@@ -253,6 +257,24 @@ def test_readyz_reports_redis_down(app_engine: Engine, redis_client: redis.Redis
     assert body["checks"]["redis"] == "unreachable"
     assert body["checks"]["jwks"] == body["checks"]["anchor_breaker"] == "unknown"
     assert services.tokens.list()  # the healthy instance is unaffected
+
+
+@pytest.mark.parametrize(("signal", "ready"), [("ok", True), ("unsynced", False)])
+def test_readyz_degrades_on_clock_desync(
+    app_engine: Engine, redis_client: redis.Redis, signal: str, ready: bool
+) -> None:
+    services = _admin(app_engine, redis_client)
+    probe = ReadinessProbe(
+        app_engine,
+        redis_client,
+        services.gateway,
+        JwksCache(redis_client, FakeOrigin(KeyPair("kid-1"))),
+        AnchorBreaker(redis_client, threshold=timedelta(minutes=10)),
+        clock_sync=lambda: signal,
+    )
+    readiness = probe.check()
+    assert readiness.checks["clock"] == signal
+    assert ("clock" in readiness.degraded) is not ready
 
 
 # ---- full policy flow with a real OPA sidecar ----

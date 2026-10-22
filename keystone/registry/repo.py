@@ -8,7 +8,7 @@ import uuid
 
 from pydantic import JsonValue
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, Engine
 
 from keystone.db.ids import uuid7
 from keystone.registry.models import SessionPolicyTemplate, TargetRole
@@ -54,6 +54,9 @@ _LIST_TEMPLATES = text(
 _GET_TEMPLATE = text(
     "SELECT id, target_role_id, ref, policy_document, enabled FROM session_policy_templates "
     "WHERE target_role_id = :role_id AND ref = :ref"
+)
+_GET_OVERRIDE = text(
+    "SELECT per_minute FROM rate_limit_overrides WHERE scope = :scope AND subject = :subject"
 )
 _INSERT_TEMPLATE = text(
     "INSERT INTO session_policy_templates (id, target_role_id, ref, policy_document, enabled) "
@@ -177,3 +180,19 @@ class RoleRegistry:
             },
         )
         return template
+
+
+class RateLimitOverrides:
+    """Tier 1 override lookup over `rate_limit_overrides` (Ch. 29: overrides live in the registry).
+
+    Read per request, so an audited registry change applies without a restart (Ch. 47). A
+    PostgreSQL failure propagates and fails the request closed (Ch. 27).
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def __call__(self, scope: str, subject: str) -> int | None:
+        with self._engine.connect() as conn:
+            value = conn.execute(_GET_OVERRIDE, {"scope": scope, "subject": subject}).scalar()
+        return None if value is None else int(value)

@@ -7,9 +7,12 @@ detailed; 5xx bodies never carry exception text, stacks, dependency names or add
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from pydantic import JsonValue
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from keystone.admin.tokens import AdminAuthFailed, AdminTokenNotFound
 from keystone.api.ratelimit import RateLimited
@@ -70,6 +73,16 @@ _STS_CODES: dict[type[ConnectorError], str] = {
 _DEPENDENCY = ApiError(
     503, "KEYSTONE_DEPENDENCY_UNAVAILABLE", "a required dependency is unavailable", True
 )
+# Ch. 27: every 503 carries Retry-After. The Action backs off 2/4/8 s regardless (Ch. 28).
+DEFAULT_RETRY_AFTER_SECONDS = 5
+# Connection loss, pool exhaustion and transient server-side failures: PostgreSQL is
+# unavailable, so the request fails closed as 503 (Ch. 27). Integrity and programming errors
+# stay unmapped and surface as 500.
+_POSTGRES_UNAVAILABLE: tuple[type[Exception], ...] = (
+    OperationalError,
+    InterfaceError,
+    PoolTimeoutError,
+)
 
 
 KNOWN_ERRORS: tuple[type[Exception], ...] = (
@@ -94,11 +107,19 @@ KNOWN_ERRORS: tuple[type[Exception], ...] = (
     RegistryConflict,
     RegistryInvalid,
     RevocationUnconfirmed,
+    *_POSTGRES_UNAVAILABLE,
 )
 
 
 def map_exception(exc: Exception) -> ApiError:
     """The API mapping for one of KNOWN_ERRORS; anything else is a programming error."""
+    error = _map(exc)
+    if error.status == 503 and error.retry_after_seconds is None:
+        return dataclasses.replace(error, retry_after_seconds=DEFAULT_RETRY_AFTER_SECONDS)
+    return error
+
+
+def _map(exc: Exception) -> ApiError:
     match exc:
         case RequestRejected():
             return exc.error
@@ -117,6 +138,8 @@ def map_exception(exc: Exception) -> ApiError:
                 retry_after_seconds=exc.retry_after_seconds,
             )
         case DependencyUnavailable() | JwksUnavailable():
+            return _DEPENDENCY
+        case _ if isinstance(exc, _POSTGRES_UNAVAILABLE):
             return _DEPENDENCY
         case AnchorStoreUnreachable():
             return ApiError(503, exc.code, "audit anchoring is unavailable; retry later", True)

@@ -1,9 +1,9 @@
 """`/readyz` (Ch. 53): can this instance complete the issuance path right now?
 
 Checks PostgreSQL, Redis, OPA's loaded bundle against the committed pin (R5 divergence), the
-anchor breaker (R7) and JWKS fresh-or-grace. Every degraded state is enumerated by name so
-traffic control can act on it; the body carries states only, never digests or addresses.
-Clock-sync (NTP) is not probed yet.
+anchor breaker (R7), JWKS fresh-or-grace and host clock sync (Ch. 31). Every degraded state is
+enumerated by name so traffic control can act on it; the body carries states only, never
+digests or addresses.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from keystone.authz.pins import BundleGateway
 from keystone.authz.service import active_pin
 from keystone.db.redis import DependencyUnavailable, guarded
 from keystone.identity.jwks import JwksCache
+from keystone.telemetry.clock import clock_sync_state
 
 OK = "ok"
 
@@ -51,6 +52,7 @@ class ReadinessProbe:
         breaker: AnchorBreaker,
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        clock_sync: Callable[[], str] | None = clock_sync_state,
     ) -> None:
         self._engine = engine
         self._redis = client
@@ -58,6 +60,7 @@ class ReadinessProbe:
         self._jwks = jwks
         self._breaker = breaker
         self._clock = clock
+        self._clock_sync = clock_sync
 
     def check(self) -> Readiness:
         checks: dict[str, str] = {}
@@ -81,6 +84,8 @@ class ReadinessProbe:
             checks["jwks"] = self._jwks_state()
         else:
             checks["anchor_breaker"] = checks["jwks"] = "unknown"
+        if self._clock_sync is not None:
+            checks["clock"] = self._clock_sync()
         return Readiness(checks)
 
     def _policy(self, pin_digest: str | None, *, postgres_ok: bool) -> str:

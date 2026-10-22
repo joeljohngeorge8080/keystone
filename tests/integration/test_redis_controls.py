@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 import redis
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from keystone.api.ratelimit import (
@@ -27,6 +28,7 @@ from keystone.audit.verify import verify_chain
 from keystone.db.ids import uuid7
 from keystone.db.redis import DependencyUnavailable, make_redis
 from keystone.identity.replay import RedisReplayStore, jti_hash, replay_ttl_ms
+from keystone.registry.repo import RateLimitOverrides
 
 pytestmark = pytest.mark.integration
 
@@ -161,6 +163,56 @@ def test_tier1_registry_override_changes_the_rate(redis_client: redis.Redis) -> 
     assert info.value.retry_after_seconds == 1  # refills at 10/s instead of one per 5 s
     clock.advance(0.2)
     limiter.check(sub="c", repository_id="7")
+
+
+def test_tier1_overrides_are_asked_for_the_repository_only(redis_client: redis.Redis) -> None:
+    clock = FakeClock(datetime(2026, 9, 19, tzinfo=UTC))
+    asked: list[tuple[str, str]] = []
+
+    def lookup(scope: str, subject: str) -> int | None:
+        asked.append((scope, subject))
+        return None
+
+    Tier1Limiter(TokenBuckets(redis_client, clock.ms), overrides=lookup).check(
+        sub="repo:acme/app:ref:main", repository_id="42"
+    )
+    assert asked == [("repository", "42")]  # the table has no identity scope (Ch. 36)
+
+
+def test_tier1_zero_override_blocks_the_repository(redis_client: redis.Redis) -> None:
+    clock = FakeClock(datetime(2026, 9, 19, tzinfo=UTC))
+    limiter = Tier1Limiter(TokenBuckets(redis_client, clock.ms), overrides=lambda scope, subject: 0)
+    with pytest.raises(RateLimited) as info:
+        limiter.check(sub="a", repository_id="7")
+    assert info.value.code == "RATE_LIMITED_REPOSITORY"
+    assert info.value.retry_after_seconds == 300
+    assert not any(k.startswith(b"rl:repo:") for k in _keys(redis_client))
+
+
+def test_registry_overrides_feed_the_repository_bucket(
+    redis_client: redis.Redis, app_engine: Engine, admin_engine: Engine
+) -> None:
+    with admin_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO rate_limit_overrides (id, scope, subject, per_minute) "
+                "VALUES (:id, 'repository', '7', 600), (:id2, 'role', 'deploy-prod', 1)"
+            ),
+            {"id": uuid7(), "id2": uuid7()},
+        )
+    lookup = RateLimitOverrides(app_engine)
+    assert lookup("repository", "7") == 600
+    assert lookup("repository", "8") is None
+    clock = FakeClock(datetime(2026, 9, 19, tzinfo=UTC))
+    limiter = Tier1Limiter(
+        TokenBuckets(redis_client, clock.ms),
+        repository_policy=BucketPolicy(limit=60, window_seconds=300, burst=1),
+        overrides=lookup,
+    )
+    limiter.check(sub="a", repository_id="7")
+    with pytest.raises(RateLimited) as info:
+        limiter.check(sub="b", repository_id="7")
+    assert info.value.retry_after_seconds == 1  # the 600/min override, not one token per 5 s
 
 
 def test_sts_inflight_cap_and_slot_release(redis_client: redis.Redis) -> None:

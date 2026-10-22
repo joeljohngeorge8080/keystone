@@ -86,9 +86,11 @@ class Stack:
         opa_url: str,
         *,
         identity_policy: BucketPolicy | None = None,
+        connector: FakeConnector | None = None,
     ) -> None:
         self.pair = KeyPair("kid-1")
-        self.connector = FakeConnector()
+        self.origin = FakeOrigin(self.pair)
+        self.connector = connector or FakeConnector()
         self.breaker = AnchorBreaker(client_redis, threshold=timedelta(minutes=10))
         sink = PostgresAuditSink()
         buckets = TokenBuckets(client_redis, _now_ms)
@@ -102,7 +104,7 @@ class Stack:
             verifier=GitHubOidcVerifier(
                 issuer=ISSUER,
                 audience=AUDIENCE,
-                jwks=JwksCache(client_redis, FakeOrigin(self.pair), sleep=lambda _: None),
+                jwks=JwksCache(client_redis, self.origin, sleep=lambda _: None),
                 replay=RedisReplayStore(client_redis),
             ),
             limiter=limiter,

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 ENV_PREFIX = "KEYSTONE_"
 
@@ -44,6 +45,19 @@ class Settings(BaseModel):
     admin_bootstrap_token: SecretStr | None = Field(default=None, min_length=32, max_length=256)
     bundle_service_token: SecretStr | None = Field(default=None, min_length=32, max_length=256)
     keystone_version: str = Field(default="0.1.0", min_length=1)
+    # Comma-separated CIDRs of the load balancers in front of the public plane (Ch. 62). Empty:
+    # X-Forwarded-For is never read and source_ip is the direct peer.
+    trusted_proxies: str = Field(default="", max_length=4096)
+    # Ch. 31: readiness degrades when the host clock is not NTP-synchronised. Off for hosts
+    # (and test shells) without a timedatectl-style sync signal.
+    clock_sync_check: bool = True
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _cidrs(cls, value: str) -> str:
+        for part in filter(None, (p.strip() for p in value.split(","))):
+            ipaddress.ip_network(part, strict=True)  # ValueError -> refuse boot
+        return value
 
     @property
     def effective_aggregation_redis_url(self) -> str:

@@ -136,10 +136,15 @@ class Tier0Shedder:
 
 
 OverrideLookup = Callable[[str, str], int | None]  # (scope, subject) -> per_minute override
+OVERRIDE_SCOPE_REPOSITORY = "repository"  # `rate_limit_overrides.scope`; identities have none
 
 
 class Tier1Limiter:
-    """Per verified identity and per repository (R3): the authoritative per-tenant control."""
+    """Per verified identity and per repository (R3): the authoritative per-tenant control.
+
+    Registry overrides (`rate_limit_overrides`) apply to the repository bucket only: the table's
+    scopes are `repository|role`, and a workload identity has no registry row to override.
+    """
 
     def __init__(
         self,
@@ -159,18 +164,25 @@ class Tier1Limiter:
         # Subjects are long and attacker-influenced; hash them so keys are fixed-size.
         return "rl:id:" + hashlib.sha256(sub.encode("utf-8")).hexdigest()
 
-    def _policy_for(self, scope: str, subject: str, default: BucketPolicy) -> BucketPolicy:
-        override = self._overrides(scope, subject)
+    def _repository_policy_for(self, repository_id: str) -> BucketPolicy | None:
+        """The repository bucket's policy; None when an override of 0 blocks the repository."""
+        default = self._repository_policy
+        override = self._overrides(OVERRIDE_SCOPE_REPOSITORY, repository_id)
         if override is None:
             return default
-        return default.with_limit(max(0, override) * (default.window_seconds // 60))
+        if override <= 0:
+            return None  # a zero refill rate would never refill; refuse without touching Redis
+        return default.with_limit(override * (default.window_seconds // 60))
 
     def check(self, *, sub: str, repository_id: str) -> None:
-        identity_policy = self._policy_for("identity", sub, self._identity_policy)
-        repo_policy = self._policy_for("repository", repository_id, self._repository_policy)
-        verdict = self._buckets.take(self._identity_key(sub), identity_policy)
+        repo_policy = self._repository_policy_for(repository_id)
+        verdict = self._buckets.take(self._identity_key(sub), self._identity_policy)
         if not verdict.allowed:
             raise RateLimited("RATE_LIMITED_IDENTITY", "identity", verdict.retry_after_seconds)
+        if repo_policy is None:
+            raise RateLimited(
+                "RATE_LIMITED_REPOSITORY", "repository", self._repository_policy.window_seconds
+            )
         verdict = self._buckets.take(f"rl:repo:{repository_id}", repo_policy)
         if not verdict.allowed:
             raise RateLimited("RATE_LIMITED_REPOSITORY", "repository", verdict.retry_after_seconds)

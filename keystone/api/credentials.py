@@ -25,6 +25,7 @@ from keystone.authz.service import AuthorizationService, Denied
 from keystone.broker.service import IdentityContext, IssuanceService
 from keystone.db.ids import uuid7
 from keystone.identity.oidc import MAX_TOKEN_BYTES, IssuerVerifier, TokenRejected, VerifiedIdentity
+from keystone.telemetry.logs import decision_id_var
 
 TOKEN_PATTERN = r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"  # noqa: S105 — JWT shape
 GRANT_PATTERN = r"^[a-z0-9][a-z0-9-]{1,63}$"
@@ -129,6 +130,7 @@ class CredentialPipeline:
         self, request: CredentialRequest, *, source_ip: str, request_id: str
     ) -> Issued | Denied:
         decision_id = uuid7()  # exists before verification: the replay record points at it
+        decision_id_var.set(str(decision_id))  # this worker thread runs in a copied context
         try:
             self._shedder.check()
         except RateLimited as exc:

@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 
 import boto3
+from celery.signals import setup_logging
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
@@ -23,12 +24,19 @@ from keystone.audit.verification import ChainVerificationTask
 from keystone.broker.reconcile import CloudTrailSessionLookup, IssuanceReconciler
 from keystone.broker.revocation import IamDenyPolicyApplier, RevocationService
 from keystone.config.settings import Settings
-from keystone.db.partitions import ensure_audit_partition, month_starts
+from keystone.db.partitions import ensure_audit_partition_as_app, month_starts
 from keystone.db.redis import make_redis
 from keystone.identity.jwks import HttpJwksSource, JwksCache
+from keystone.telemetry.logs import configure_logging
 from keystone.workers.celery_app import make_celery
 
 app = make_celery(os.environ.get("KEYSTONE_CELERY_BROKER_URL", "memory://"))
+
+
+@setup_logging.connect
+def _json_logs(**_: object) -> None:
+    # Connecting this signal stops Celery installing its own handlers (Ch. 49: one format).
+    configure_logging("worker")
 
 
 @dataclass(slots=True)
@@ -93,8 +101,7 @@ def ensure_partitions(months_ahead: int = 14) -> int:
     with rt.engine.begin() as conn:
         created = 0
         for month in month_starts(date.today(), count=months_ahead):
-            ensure_audit_partition(conn, month)
-            created += 1
+            created += ensure_audit_partition_as_app(conn, month)
     return created
 
 

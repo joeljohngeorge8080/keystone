@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Sequence
 from datetime import timedelta
 
 from fastapi import FastAPI, Request
@@ -25,7 +26,15 @@ from starlette.concurrency import run_in_threadpool
 
 from keystone.api.credentials import CredentialHandler, CredentialPipeline, CredentialRequest
 from keystone.api.errors import KNOWN_ERRORS, map_exception
-from keystone.api.http import error_response, install_common, json_response, read_json
+from keystone.api.http import (
+    Network,
+    client_ip,
+    error_response,
+    install_common,
+    json_response,
+    parse_networks,
+    read_json,
+)
 from keystone.api.ratelimit import StsInflightGuard, Tier0Shedder, Tier1Limiter, TokenBuckets
 from keystone.audit.aggregation import FailureAggregator
 from keystone.audit.anchor import AnchorBreaker
@@ -39,6 +48,8 @@ from keystone.db.redis import make_redis
 from keystone.identity.jwks import HttpJwksSource, JwksCache
 from keystone.identity.oidc import GitHubOidcVerifier
 from keystone.identity.replay import RedisReplayStore
+from keystone.registry.repo import RateLimitOverrides
+from keystone.telemetry.logs import configure_logging
 
 MAX_BODY_BYTES = 32 * 1024
 _log = logging.getLogger("keystone.api")
@@ -58,7 +69,7 @@ def _denied(denied: Denied, request_id: str) -> JSONResponse:
     return json_response(403, {"decision_id": str(denied.decision_id), "error": error})
 
 
-def create_app(pipeline: CredentialHandler) -> FastAPI:
+def create_app(pipeline: CredentialHandler, *, trusted_proxies: Sequence[Network] = ()) -> FastAPI:
     # The OpenAPI schema is a build artifact (Ch. 39), not something the public plane serves.
     app = FastAPI(title="Keystone", docs_url=None, redoc_url=None, openapi_url=None)
     install_common(app, _log)
@@ -73,7 +84,7 @@ def create_app(pipeline: CredentialHandler) -> FastAPI:
         request_id: str = request.state.request_id
         try:
             payload = await read_json(request, CredentialRequest, max_bytes=MAX_BODY_BYTES)
-            source_ip = request.client.host if request.client else "unknown"
+            source_ip = client_ip(request, trusted_proxies)
             outcome = await run_in_threadpool(
                 pipeline.handle, payload, source_ip=source_ip, request_id=request_id
             )
@@ -104,7 +115,7 @@ def build_pipeline(settings: Settings) -> CredentialPipeline:
             jwks=JwksCache(primary, HttpJwksSource(settings.jwks_url)),
             replay=RedisReplayStore(primary),
         ),
-        limiter=Tier1Limiter(buckets),
+        limiter=Tier1Limiter(buckets, overrides=RateLimitOverrides(engine)),
         authorizer=AuthorizationService(
             engine,
             sink,
@@ -131,4 +142,8 @@ def build_pipeline(settings: Settings) -> CredentialPipeline:
 
 
 def app_from_env() -> FastAPI:
-    return create_app(build_pipeline(Settings.from_env(os.environ)))
+    configure_logging("public")
+    settings = Settings.from_env(os.environ)
+    return create_app(
+        build_pipeline(settings), trusted_proxies=parse_networks(settings.trusted_proxies)
+    )

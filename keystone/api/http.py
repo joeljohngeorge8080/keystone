@@ -8,9 +8,10 @@ refused, and validated without echoing hostile input back.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -22,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from keystone.api.errors import KNOWN_ERRORS, ApiError, envelope, map_exception, rejected
 from keystone.db.ids import uuid7
+from keystone.telemetry.logs import request_id_var
 
 
 def json_response(
@@ -45,6 +47,45 @@ def request_id_of(request: Request) -> str:
     return str(getattr(request.state, "request_id", "unknown"))
 
 
+Network = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def parse_networks(value: str) -> tuple[Network, ...]:
+    """Comma-separated CIDRs (`KEYSTONE_TRUSTED_PROXIES`); raises ValueError on any bad entry."""
+    return tuple(
+        ipaddress.ip_network(part.strip(), strict=True) for part in value.split(",") if part.strip()
+    )
+
+
+def _trusted(address: str, trusted: Sequence[Network]) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip in network for network in trusted)
+
+
+def client_ip(request: Request, trusted: Sequence[Network] = ()) -> str:
+    """The caller's address for the policy input and audit record.
+
+    Only a peer inside a configured trusted-proxy network is believed about `X-Forwarded-For`,
+    and the header is read right to left, skipping trusted hops: the first untrusted address is
+    the client. Anything malformed falls back to the direct peer, never to a client-chosen value.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if not trusted or not _trusted(peer, trusted):
+        return peer
+    hops = [h.strip() for h in ",".join(request.headers.getlist("x-forwarded-for")).split(",")]
+    for hop in reversed(hops):
+        try:
+            ipaddress.ip_address(hop)
+        except ValueError:
+            return peer
+        if not _trusted(hop, trusted):
+            return hop
+    return peer
+
+
 def install_common(app: FastAPI, log: logging.Logger, *, map_known_errors: bool = False) -> None:
     """Request-id + no-store middleware, the 404/405 envelope and the generic 500.
 
@@ -57,7 +98,11 @@ def install_common(app: FastAPI, log: logging.Logger, *, map_known_errors: bool 
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         request.state.request_id = str(uuid7())
-        response = await call_next(request)
+        bound = request_id_var.set(request.state.request_id)  # joins logs to the response
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(bound)
         response.headers["X-Request-Id"] = request.state.request_id
         response.headers["Cache-Control"] = "no-store"
         return response

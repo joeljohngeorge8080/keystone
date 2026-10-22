@@ -1,4 +1,9 @@
-"""`keystone` operator CLI (Ch. 45). Exit codes: 0 ok, 1 finding/divergence, 2 usage error."""
+"""`keystone` operator CLI (Ch. 45). Exit codes: 0 ok, 1 finding/divergence, 2 usage error.
+
+`audit verify|export` read PostgreSQL directly (KEYSTONE_DATABASE_URL) or an export file, so the
+chain can be checked without trusting the service. Every other command talks to the admin plane
+(KEYSTONE_ADMIN_URL + a bearer from KEYSTONE_ADMIN_TOKEN[_FILE]); see `keystone_cli.client`.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ import json
 import os
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import IO
 
@@ -18,12 +23,10 @@ from sqlalchemy import create_engine
 from keystone.audit.chain import GENESIS_PREV_HASH
 from keystone.audit.store import load_events, prev_hash_before, snapshot_head
 from keystone.audit.verify import ChainHead, StoredEvent, VerificationResult, verify_chain
+from keystone_cli import admin, replay
+from keystone_cli.client import AdminClient, ApiFailure, UsageError
 
 DATABASE_URL_ENV = "KEYSTONE_DATABASE_URL"
-
-
-class UsageError(Exception):
-    pass
 
 
 def _database_url() -> str:
@@ -150,20 +153,33 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--from", dest="from_seq", type=int, default=1)
     export.add_argument("--to", dest="to_seq", type=int, default=None)
     export.set_defaults(func=cmd_audit_export)
+    admin.register_audit_tail(audit_sub)
+
+    admin.register(sub)
+    replay.register(sub)
     return parser
 
 
-def main(argv: Sequence[str] | None = None, out: IO[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    out: IO[str] | None = None,
+    client_factory: Callable[[], AdminClient] = AdminClient.from_env,
+) -> int:
     out = sys.stdout if out is None else out
     args = build_parser().parse_args(argv)
-    if args.from_seq < 1:
+    if getattr(args, "from_seq", 1) < 1:
         sys.stderr.write("--from must be >= 1\n")
         return 2
     try:
-        code: int = args.func(args, out)
-    except (UsageError, LookupError, OSError) as exc:
+        handler: admin.Handler | None = getattr(args, "admin_handler", None)
+        code: int = (
+            args.func(args, out) if handler is None else handler(args, client_factory(), out)
+        )
+    except (UsageError, ApiFailure, LookupError, OSError) as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 2
+    except KeyboardInterrupt:
+        return 0  # stopping `tail --follow` is the normal way out
     return code
 
 

@@ -98,19 +98,30 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       have bodies but no end-to-end worker run
 - [ ] S3 conditional put (`IfNoneMatch: *`) is on by default but only moto-tested without it
 
-## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, API/CLI not started
+## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, public API DONE, admin plane partial
 - [x] Issuance reconciler (R6): one transaction per row, `indeterminate` until the 20 min
       CloudTrail window passes, `issued_undelivered` when a session is found, never rewrites
 - [x] Revocation (Ch. 26, F6): flagged -> IAM deny policy -> read-back confirm -> applied;
       mechanism 3 OFF by default renders the runbook policy; reverse-crash backfill
-- [x] `POST /v1/credentials` request pipeline (Tier 0 -> verify -> Tier 1 -> authorize -> issue
-      -> single-shot response -> mark delivered) + `/healthz` and the Ch. 41 transport/schema
-      layers and Ch. 43 error envelope (uniform pre-auth 401, no-store, request_id), in
-      `keystone/api/{app,credentials,errors}.py`; `uvicorn --factory keystone.api.app:app_from_env`
-- [ ] Rate-limit overrides from `rate_limit_overrides` (Tier1Limiter runs on defaults), trusted
-      proxy handling for `source_ip`, structured JSON logging (Ch. 49), separate listener planes
-- [ ] Admin plane
-- [ ] Admin bearer-token auth, `/readyz` with pin-divergence + breaker signals
+- [x] `POST /v1/credentials` request pipeline (Tier 0 -> verify -> Tier 1 -> anchor breaker (R7)
+      -> authorize -> issue -> single-shot response -> mark delivered) + `/healthz` and the
+      Ch. 41 transport/schema layers and Ch. 43 error envelope (uniform pre-auth 401, no-store,
+      request_id), in `keystone/api/`; `uvicorn --factory keystone.api.app:app_from_env`
+- [x] Admin plane slice 1 (`keystone/admin/`, own listener:
+      `uvicorn --factory keystone.admin.app:admin_app_from_env`): hash-stored bearer tokens with
+      env bootstrap (KEYSTONE_ADMIN_BOOTSTRAP_TOKEN, registered once when no principal exists,
+      24 h), `GET|POST /v1/admin/tokens`, `DELETE /v1/admin/tokens/{id}`; `/readyz` (PG, Redis,
+      OPA loaded digest vs pin, anchor breaker, JWKS fresh-or-grace; unauthenticated, states
+      only); `GET|POST /v1/policy/pins`, `GET /v1/policy/status`; bundle route for the OPA
+      sidecar behind KEYSTONE_BUNDLE_SERVICE_TOKEN (`opa_config_yaml(bearer_token_path=...)`)
+- [ ] Admin plane slice 2: roles + session-policy templates, `POST /v1/revocations`,
+      `/v1/decisions/{id}`, `/v1/audit/events`, `/v1/audit/verify`, `/v1/issuances`
+- [ ] Rate-limit overrides from `rate_limit_overrides` (Tier1Limiter runs on defaults; note the
+      table's scopes are `repository|role` while the limiter asks for `identity|repository`),
+      trusted proxy handling for `source_ip`, structured JSON logging (Ch. 49), `/readyz` clock
+      sync (NTP) signal
+- [ ] The staged bundle lives in admin-process memory: after an admin restart OPA's polls get
+      404 (it keeps its loaded bundle) until the next pin; persist or re-stage on boot
 - [ ] CLI admin commands (`roles`, `policy pin/status`, `decisions`, `revoke role`, `replay`)
 - [ ] Dashboard (Ch. 44), GitHub Action (Ch. 46), metrics (Ch. 51), Docker/compose, Terraform
 

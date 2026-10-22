@@ -6,7 +6,7 @@ import shutil
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -25,6 +25,7 @@ from keystone.api.ratelimit import (
     TokenBuckets,
 )
 from keystone.audit.aggregation import FailureAggregator
+from keystone.audit.anchor import AnchorBreaker
 from keystone.audit.events import EventType
 from keystone.audit.sink import PostgresAuditSink
 from keystone.audit.store import load_events, snapshot_head
@@ -88,6 +89,7 @@ class Stack:
     ) -> None:
         self.pair = KeyPair("kid-1")
         self.connector = FakeConnector()
+        self.breaker = AnchorBreaker(client_redis, threshold=timedelta(minutes=10))
         sink = PostgresAuditSink()
         buckets = TokenBuckets(client_redis, _now_ms)
         limiter = (
@@ -110,6 +112,7 @@ class Stack:
             sts_slots=StsInflightGuard(client_redis),
             issuer=IssuanceService(engine, sink, self.connector),
             aggregator=FailureAggregator(client_redis),
+            breaker=self.breaker,
             region_hint="eu-west-1",
         )
         self.client = TestClient(create_app(pipeline), raise_server_exceptions=False)
@@ -288,6 +291,25 @@ def test_unregistered_grant_allowed_by_policy_is_a_registry_divergence(
         EventType.CREDENTIAL_ISSUE_FAILED.value,
     ]
     assert stack.connector.requests == []
+
+
+def test_anchor_breaker_open_refuses_issuance_before_any_decision(
+    stack: Stack, app_engine: Engine
+) -> None:
+    # R7: external anchor store unreachable past the threshold => issuance answers 503.
+    stack.breaker.record_failure(datetime.now(UTC) - timedelta(minutes=11))
+    response = stack.post(stack.token())
+    assert response.status_code == 503
+    error = response.json()["error"]
+    assert error["code"] == "AUDIT_ANCHOR_STORE_UNREACHABLE" and error["retryable"] is True
+    assert stack.connector.requests == []
+    with app_engine.connect() as conn:
+        assert snapshot_head(conn).seq == 0
+
+
+def test_anchor_outage_under_threshold_still_issues(stack: Stack) -> None:
+    stack.breaker.record_failure(datetime.now(UTC) - timedelta(minutes=2))
+    assert stack.post(stack.token()).status_code == 201
 
 
 def test_request_ids_are_unique_per_response(stack: Stack) -> None:

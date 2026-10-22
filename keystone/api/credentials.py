@@ -1,5 +1,5 @@
-"""`POST /v1/credentials` pipeline (Ch. 39-43): Tier 0 -> verify -> Tier 1 -> authorize ->
-STS slot -> issue.
+"""`POST /v1/credentials` pipeline (Ch. 39-43): Tier 0 -> verify -> Tier 1 -> anchor breaker ->
+authorize -> STS slot -> issue.
 
 Framework-free on purpose: `app.py` owns transport (body cap, content type, envelope) and calls
 `handle()` in a worker thread. Pre-decision failures are counted by the bounded aggregator (R4),
@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from keystone.api.ratelimit import RateLimited, StsInflightGuard, Tier0Shedder, Tier1Limiter
 from keystone.audit.aggregation import AggregatedFailure, FailureAggregator
+from keystone.audit.anchor import AnchorBreaker
 from keystone.authz.service import AuthorizationService, Denied
 from keystone.broker.service import IdentityContext, IssuanceService
 from keystone.db.ids import uuid7
@@ -108,7 +110,9 @@ class CredentialPipeline:
         sts_slots: StsInflightGuard,
         issuer: IssuanceService,
         aggregator: FailureAggregator,
+        breaker: AnchorBreaker,
         region_hint: str,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._shedder = shedder
         self._verifier = verifier
@@ -117,7 +121,9 @@ class CredentialPipeline:
         self._sts_slots = sts_slots
         self._issuer = issuer
         self._aggregator = aggregator
+        self._breaker = breaker
         self._region_hint = region_hint
+        self._clock = clock
 
     def handle(
         self, request: CredentialRequest, *, source_ip: str, request_id: str
@@ -145,6 +151,9 @@ class CredentialPipeline:
                 AggregatedFailure.RATE_LIMITED, _subject_key(identity.sub), exc.code
             )
             raise
+        # R7: while the external anchor store is unreachable past the threshold, the
+        # un-anchored window must not grow, so nothing is decided or minted.
+        self._breaker.check(self._clock())
         outcome = self._authorizer.authorize(
             identity,
             grant=request.grant,

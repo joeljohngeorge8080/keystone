@@ -8,6 +8,7 @@ A load timeout leaves the pin unchanged (409). Rollback to a lower sequence requ
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -100,6 +101,23 @@ _INSERT = text(
     "VALUES (:id, :digest, :sequence, true, :forced, :pinned_by)"
 )
 _LOCK = text("SELECT pg_advisory_xact_lock(hashtext('policy_pins'))")
+_HISTORY = text(
+    "SELECT p.id, p.bundle_digest, p.bundle_sequence, p.active, p.forced_rollback, "
+    "p.pinned_at, a.name AS pinned_by FROM policy_pins p "
+    "LEFT JOIN admin_principals a ON a.id = p.pinned_by "
+    "ORDER BY p.pinned_at DESC, p.id DESC LIMIT :limit"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PinRecord:
+    id: uuid.UUID
+    bundle_digest: str
+    bundle_sequence: int
+    active: bool
+    forced_rollback: bool
+    pinned_at: datetime
+    pinned_by: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +131,20 @@ class PinResult:
 class PolicyPinRepository:
     def __init__(self, connection: Connection) -> None:
         self._conn = connection
+
+    def history(self, limit: int = 50) -> list[PinRecord]:
+        return [
+            PinRecord(
+                id=row.id,
+                bundle_digest=row.bundle_digest,
+                bundle_sequence=int(row.bundle_sequence),
+                active=row.active,
+                forced_rollback=row.forced_rollback,
+                pinned_at=row.pinned_at,
+                pinned_by=row.pinned_by,
+            )
+            for row in self._conn.execute(_HISTORY, {"limit": limit})
+        ]
 
     def commit_pin(
         self,
@@ -225,13 +257,27 @@ class PinActivator:
 
 
 def opa_config_yaml(
-    *, bundle_service_url: str, resource: str, verification_key_pem: str, poll_seconds: int = 5
+    *,
+    bundle_service_url: str,
+    resource: str,
+    verification_key_pem: str,
+    poll_seconds: int = 5,
+    bearer_token_path: str | None = None,
 ) -> str:
-    """OPA sidecar config: poll Keystone's admin plane for the bundle and verify its signature."""
+    """OPA sidecar config: poll Keystone's admin plane for the bundle and verify its signature.
+
+    `bearer_token_path` points OPA at a file holding the bundle-service token, so the secret is
+    never written into the config itself."""
     indented_key = "\n".join("      " + line for line in verification_key_pem.strip().splitlines())
+    credentials = (
+        f"    credentials:\n      bearer:\n        token_path: {json.dumps(bearer_token_path)}\n"
+        if bearer_token_path
+        else ""
+    )
     return (
         "services:\n"
         f"  keystone:\n    url: {bundle_service_url}\n"
+        f"{credentials}"
         "bundles:\n"
         "  keystone:\n"
         "    service: keystone\n"

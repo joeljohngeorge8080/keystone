@@ -150,6 +150,15 @@ class JwksCache:
         self._local = None
         self._keys(force_refresh=True)
 
+    def freshness(self) -> str:
+        """Readiness signal (Ch. 53 "fresh-or-grace"): `fresh`, `grace` (stale within the 6 h
+        Redis ceiling) or `cold` (nothing cached). Reads Redis only; never touches origin."""
+        raw = guarded(lambda: self._redis.exists(_RAW_KEY))
+        if not raw:
+            return "cold"
+        until = cast(bytes | None, guarded(lambda: self._redis.get(_FRESH_UNTIL_KEY)))
+        return "fresh" if until and float(until) > self._now() else "grace"
+
     # ---- tiers ----
 
     def _now(self) -> float:

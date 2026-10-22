@@ -53,3 +53,18 @@ def test_test_only_variables_do_not_block_boot() -> None:
 def test_missing_required_settings_fail_loud() -> None:
     with pytest.raises(SettingsError, match="KEYSTONE_AWS_REGION"):
         Settings.from_env({k: v for k, v in BASE.items() if k != "KEYSTONE_AWS_REGION"})
+
+
+def test_operational_secrets_never_render() -> None:
+    secret = "b" * 40
+    settings = Settings.from_env(
+        {**BASE, "KEYSTONE_ADMIN_BOOTSTRAP_TOKEN": secret, "KEYSTONE_BUNDLE_SERVICE_TOKEN": secret}
+    )
+    assert settings.admin_bootstrap_token is not None
+    assert settings.admin_bootstrap_token.get_secret_value() == secret
+    assert secret not in repr(settings) and secret not in str(settings)
+
+
+def test_short_operational_secrets_refuse_boot() -> None:
+    with pytest.raises(SettingsError, match="KEYSTONE_ADMIN_BOOTSTRAP_TOKEN"):
+        Settings.from_env({**BASE, "KEYSTONE_ADMIN_BOOTSTRAP_TOKEN": "short"})

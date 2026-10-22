@@ -11,8 +11,12 @@ from dataclasses import dataclass
 
 from pydantic import JsonValue
 
+from keystone.admin.tokens import AdminAuthFailed, AdminTokenNotFound
 from keystone.api.ratelimit import RateLimited
+from keystone.audit.anchor import AnchorStoreUnreachable
+from keystone.authz.bundles import BundleError
 from keystone.authz.evaluator import DecisionMalformed
+from keystone.authz.pins import PinSequenceRejected, PolicyLoadTimeout
 from keystone.authz.service import NoActivePin, PolicyPinDivergence
 from keystone.broker.connectors.base import (
     AccessDeniedError,
@@ -70,6 +74,7 @@ KNOWN_ERRORS: tuple[type[Exception], ...] = (
     RequestRejected,
     TokenRejected,
     RateLimited,
+    AnchorStoreUnreachable,
     DependencyUnavailable,
     JwksUnavailable,
     NoActivePin,
@@ -79,6 +84,11 @@ KNOWN_ERRORS: tuple[type[Exception], ...] = (
     PolicyRegistryDivergence,
     TtlDenied,
     ConnectorError,
+    AdminAuthFailed,
+    AdminTokenNotFound,
+    BundleError,
+    PinSequenceRejected,
+    PolicyLoadTimeout,
 )
 
 
@@ -103,6 +113,8 @@ def map_exception(exc: Exception) -> ApiError:
             )
         case DependencyUnavailable() | JwksUnavailable():
             return _DEPENDENCY
+        case AnchorStoreUnreachable():
+            return ApiError(503, exc.code, "audit anchoring is unavailable; retry later", True)
         case NoActivePin() | PolicyPinDivergence():
             return ApiError(503, exc.code, "policy is not ready; retry later", True)
         case DecisionMalformed():
@@ -123,6 +135,17 @@ def map_exception(exc: Exception) -> ApiError:
         case ConnectorError():
             code = next(_STS_CODES[c] for c in type(exc).__mro__ if c in _STS_CODES)
             return ApiError(exc.http_status, code, "credential minting failed", exc.retryable)
+        case AdminAuthFailed():
+            # One answer for missing/unknown/expired/revoked: no oracle for token state.
+            return ApiError(401, exc.code, "admin bearer token required", False)
+        case AdminTokenNotFound():
+            return ApiError(404, exc.code, "no such admin token", False)
+        case BundleError():
+            return ApiError(400, "POLICY_BUNDLE_INVALID", str(exc), False)
+        case PinSequenceRejected():
+            return ApiError(409, exc.code, str(exc), False)
+        case PolicyLoadTimeout():
+            return ApiError(409, exc.code, str(exc), True)
         case _:
             raise TypeError(f"no API mapping for {type(exc).__name__}")
 

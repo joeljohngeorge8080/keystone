@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 ENV_PREFIX = "KEYSTONE_"
 
@@ -40,6 +40,9 @@ class Settings(BaseModel):
     anchor_bucket: str | None = None
     anchor_breaker_threshold_seconds: int = Field(default=600, ge=60, le=86400)
     revocation_put_role_policy_enabled: bool = False  # Ch. 26 mechanism 3, default OFF
+    # Host-injected secrets (Ch. 48). SecretStr keeps them out of repr/str and logs.
+    admin_bootstrap_token: SecretStr | None = Field(default=None, min_length=32, max_length=256)
+    bundle_service_token: SecretStr | None = Field(default=None, min_length=32, max_length=256)
     keystone_version: str = Field(default="0.1.0", min_length=1)
 
     @property

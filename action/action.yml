@@ -1,0 +1,43 @@
+name: keystone-auth
+description: >-
+  Exchange this job's GitHub OIDC token for short-lived AWS credentials from a Keystone broker.
+  Requires `permissions: id-token: write`. Credentials are masked before they are exported.
+branding:
+  icon: key
+  color: gray-dark
+inputs:
+  keystone_url:
+    description: Keystone public-plane base URL (https).
+    required: true
+  grant:
+    description: The grant to request, e.g. deploy-prod.
+    required: true
+  ttl_seconds:
+    description: Requested credential lifetime; the broker may clamp it.
+    required: false
+    default: ""
+  retry:
+    description: Retries on 429/503 or network errors (2/4/8 s back-off), each with a fresh token.
+    required: false
+    default: "3"
+  audience:
+    description: OIDC audience to request; must equal the broker's KEYSTONE_OIDC_AUDIENCE.
+    required: false
+    default: ""
+outputs:
+  decision_id:
+    description: The Keystone decision id (also exported as KEYSTONE_DECISION_ID).
+    value: ${{ steps.exchange.outputs.decision_id }}
+runs:
+  using: composite
+  steps:
+    - id: exchange
+      shell: bash
+      # Inputs reach the script only as environment variables, never spliced into the script.
+      env:
+        INPUT_KEYSTONE_URL: ${{ inputs.keystone_url }}
+        INPUT_GRANT: ${{ inputs.grant }}
+        INPUT_TTL_SECONDS: ${{ inputs.ttl_seconds }}
+        INPUT_RETRY: ${{ inputs.retry }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+      run: python3 -I "$GITHUB_ACTION_PATH/keystone_auth.py"

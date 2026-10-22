@@ -1,0 +1,31 @@
+[
+  {
+    "name": "deploy-prod: push to main",
+    "input": {
+      "schema": 1,
+      "identity": {
+        "iss": "https://token.actions.githubusercontent.com",
+        "aud": "keystone-acme",
+        "sub": "repo:acme/app:ref:refs/heads/main",
+        "repository": "acme/app",
+        "repository_owner": "acme",
+        "repository_id": "42",
+        "ref": "refs/heads/main",
+        "sha": "0123abcd",
+        "workflow_ref": "acme/app/.github/workflows/deploy.yml@refs/heads/main",
+        "job_workflow_ref": "acme/app/.github/workflows/deploy.yml@refs/heads/main",
+        "run_id": "1234",
+        "run_attempt": "1",
+        "actor": "octocat",
+        "event_name": "push"
+      },
+      "request": {
+        "grant": "deploy-prod",
+        "requested_ttl_seconds": 900,
+        "source_ip": "203.0.113.9",
+        "received_at": "2026-10-23T00:00:00+00:00"
+      },
+      "context": {"keystone_version": "0.1.0", "policy_version": "sha256:test"}
+    }
+  }
+]

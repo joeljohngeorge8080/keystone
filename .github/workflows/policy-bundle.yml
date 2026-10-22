@@ -4,9 +4,9 @@ name: policy-bundle
 on:
   push:
     branches: [main]
-    paths: ["policies/**", "keystone/authz/policy_verify/**", ".github/workflows/policy-bundle.yml"]
+    paths: ["policies/**", "keystone/authz/policy_verify/**", "tests/policy/hostile_seeds.json", ".github/workflows/policy-bundle.yml"]
   pull_request:
-    paths: ["policies/**", "keystone/authz/policy_verify/**", ".github/workflows/policy-bundle.yml"]
+    paths: ["policies/**", "keystone/authz/policy_verify/**", "tests/policy/hostile_seeds.json", ".github/workflows/policy-bundle.yml"]
 
 permissions:
   contents: read
@@ -28,6 +28,9 @@ jobs:
       - run: opa test --coverage --threshold 100 policies
       - name: keystone-policy-verify (required, non-skippable)
         run: uv run keystone-policy-verify policies
+      # R2: validator pass AND hostile-matrix pass are both required before signing.
+      - name: Hostile matrix (required, non-skippable)
+        run: uv run python -m keystone.authz.policy_verify.hostile policies --seeds tests/policy/hostile_seeds.json
 
   build-and-sign:
     needs: validate
@@ -39,17 +42,24 @@ jobs:
         with:
           version: latest
       - uses: sigstore/cosign-installer@v3
-      - name: Stamp CI-assigned bundle_sequence into the manifest (R8 — never author-supplied)
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install
+      - run: uv sync --locked --no-dev
+      # R8: revision = content digest of the sources, bundle_sequence = this CI counter (never
+      # author- or admin-supplied), OPA-signed with the key whose public half OPA trusts. The
+      # build inspects the result exactly as POST /v1/policy/pins will. The key reaches the
+      # step through `env`, never interpolated into the script.
+      - name: Build and OPA-sign the bundle
+        env:
+          OPA_BUNDLE_SIGNING_KEY: ${{ secrets.OPA_BUNDLE_SIGNING_KEY }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          path = "policies/.manifest"
-          manifest = json.load(open(path))
-          manifest["revision"] = os.environ["GITHUB_SHA"]
-          manifest.setdefault("metadata", {})["bundle_sequence"] = int(os.environ["GITHUB_RUN_NUMBER"])
-          json.dump(manifest, open(path, "w"), indent=2)
-          PY
-      - run: opa build -b policies --ignore '*_test.rego' -o keystone-policy-bundle.tar.gz
+          umask 077
+          key="$RUNNER_TEMP/opa-signing.pem"
+          printf '%s\n' "$OPA_BUNDLE_SIGNING_KEY" > "$key"
+          uv run python -m keystone.authz.build_bundle --policies policies \
+            --sequence "$GITHUB_RUN_NUMBER" --signing-key "$key" \
+            --out keystone-policy-bundle.tar.gz
+          rm -f "$key"
       - run: sha256sum keystone-policy-bundle.tar.gz | tee keystone-policy-bundle.sha256
       - name: Cosign keyless sign (only reachable after validate succeeded)
         run: cosign sign-blob --yes --bundle keystone-policy-bundle.cosign keystone-policy-bundle.tar.gz

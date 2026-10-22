@@ -52,13 +52,13 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> Settings:
+        # Test-only variables share the prefix but are not settings: KEYSTONE_TEST_* is a reserved
+        # namespace no setting may use, so any other unknown key still refuses boot.
         raw = {
             key[len(ENV_PREFIX) :].lower(): value
             for key, value in environ.items()
-            if key.startswith(ENV_PREFIX)
+            if key.startswith(ENV_PREFIX) and not key.startswith(ENV_PREFIX + "TEST_")
         }
-        # Test-only variables share the prefix but are not settings.
-        raw.pop("test_database_url", None)
         raw.pop("opa_bin", None)
         try:
             return cls(**raw)

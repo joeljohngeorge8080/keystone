@@ -37,6 +37,19 @@ def test_refuses_to_start_on_invalid_or_unknown_settings(bad: dict[str, str]) ->
         Settings.from_env({**BASE, **bad})
 
 
+def test_test_only_variables_do_not_block_boot() -> None:
+    # The documented local run exports these next to the real settings (HANDOFF "How to run").
+    settings = Settings.from_env(
+        {
+            **BASE,
+            "KEYSTONE_TEST_DATABASE_URL": "postgresql+psycopg://t:t@h/test",
+            "KEYSTONE_TEST_REDIS_URL": "redis://t:6379/0",
+            "KEYSTONE_OPA_BIN": "/usr/local/bin/opa",
+        }
+    )
+    assert settings.redis_url == "redis://r:6379/0"
+
+
 def test_missing_required_settings_fail_loud() -> None:
     with pytest.raises(SettingsError, match="KEYSTONE_AWS_REGION"):
         Settings.from_env({k: v for k, v in BASE.items() if k != "KEYSTONE_AWS_REGION"})

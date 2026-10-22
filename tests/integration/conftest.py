@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import Iterator
+from datetime import date
 
 import pytest
 import redis
@@ -10,12 +11,14 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from keystone.db.partitions import ensure_audit_partition
 from keystone.db.redis import make_redis
 
 DATABASE_URL_ENV = "KEYSTONE_TEST_DATABASE_URL"
 REDIS_URL_ENV = "KEYSTONE_TEST_REDIS_URL"
 APP_LOGIN_ROLE = "keystone_app_login"
 APP_LOGIN_PASSWORD = "app-test-only"  # throwaway local test credential
+PINNED_TEST_MONTH = date(2026, 9, 1)  # every fixed test clock is in this month
 
 
 def _admin_url() -> str:
@@ -40,6 +43,9 @@ def admin_engine() -> Iterator[Engine]:
         connection.execute(text("CREATE SCHEMA public"))
     _migrate(url)
     with engine.begin() as connection:
+        # Migration 0001 seeds partitions from the month it runs in; tests pin their clocks to
+        # PINNED_TEST_MONTH, which falls outside that window once the calendar moves past it.
+        ensure_audit_partition(connection, PINNED_TEST_MONTH)
         connection.execute(
             text(
                 f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "

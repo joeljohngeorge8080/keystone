@@ -103,8 +103,13 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       CloudTrail window passes, `issued_undelivered` when a session is found, never rewrites
 - [x] Revocation (Ch. 26, F6): flagged -> IAM deny policy -> read-back confirm -> applied;
       mechanism 3 OFF by default renders the runbook policy; reverse-crash backfill
-- [ ] `POST /v1/credentials` request pipeline (Tier 0 -> verify -> Tier 1 -> authorize -> issue
-      -> single-shot response -> mark delivered), admin plane, error envelope (Ch. 39-43)
+- [x] `POST /v1/credentials` request pipeline (Tier 0 -> verify -> Tier 1 -> authorize -> issue
+      -> single-shot response -> mark delivered) + `/healthz` and the Ch. 41 transport/schema
+      layers and Ch. 43 error envelope (uniform pre-auth 401, no-store, request_id), in
+      `keystone/api/{app,credentials,errors}.py`; `uvicorn --factory keystone.api.app:app_from_env`
+- [ ] Rate-limit overrides from `rate_limit_overrides` (Tier1Limiter runs on defaults), trusted
+      proxy handling for `source_ip`, structured JSON logging (Ch. 49), separate listener planes
+- [ ] Admin plane
 - [ ] Admin bearer-token auth, `/readyz` with pin-divergence + breaker signals
 - [ ] CLI admin commands (`roles`, `policy pin/status`, `decisions`, `revoke role`, `replay`)
 - [ ] Dashboard (Ch. 44), GitHub Action (Ch. 46), metrics (Ch. 51), Docker/compose, Terraform

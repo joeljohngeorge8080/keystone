@@ -16,6 +16,8 @@ dependencies = [
   "pyjwt>=2.10,<3",
   "httpx>=0.28,<1",
   "celery[redis]>=5.4,<6",
+  "fastapi>=0.159,<1",
+  "uvicorn>=0.54,<1",
 ]
 
 [project.scripts]

@@ -1,0 +1,223 @@
+# Keystone MVP stack (Ch. 62, 63; process topology per R7 / round-2 Ch. 9).
+#
+#   cp deploy/.env.example deploy/.env    # fill in; never commit it
+#   docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+#
+# Topology: `opa`, `api` and `admin` share one network namespace (the Ch. 21 sidecar rule:
+# Keystone reaches OPA on 127.0.0.1 only, and OPA polls the admin plane's bundle route on
+# 127.0.0.1). The public plane is published on ${PUBLIC_BIND:-0.0.0.0}:8080 behind your TLS
+# terminator; the admin plane only on the host's loopback (reach it over a VPN or SSH tunnel).
+# Two workers on two queues (R7: anchoring is never starved by aggregation work), one beat.
+# Two Redis instances: `redis` (noeviction: replay, rate limits, breaker, Celery) and
+# `redis-agg` (allkeys-lru, its own memory budget: failure aggregation only, R4).
+#
+# Secrets (Ch. 48): passwords and tokens are env-injected from deploy/.env, the host secret
+# mechanism of this MVP. Only the two key files are mounted, as /run/secrets bind mounts.
+# (Compose's env-sourced `secrets:` are copied into the container, which a read-only rootfs
+# refuses, so they are deliberately not used.)
+
+name: keystone
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp"]
+
+x-service-env: &service-env
+  KEYSTONE_DATABASE_URL: postgresql+psycopg://keystone_svc:${APP_DB_PASSWORD:?}@postgres:5432/keystone
+  KEYSTONE_REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/0
+  KEYSTONE_AGGREGATION_REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis-agg:6379/0
+  KEYSTONE_CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/1
+  KEYSTONE_AWS_REGION: ${KEYSTONE_AWS_REGION:?}
+  KEYSTONE_OIDC_AUDIENCE: ${KEYSTONE_OIDC_AUDIENCE:?}
+  KEYSTONE_ANCHOR_BUCKET: ${KEYSTONE_ANCHOR_BUCKET:-}
+  KEYSTONE_STS_ENDPOINT_URL: ${KEYSTONE_STS_ENDPOINT_URL:-}
+  KEYSTONE_TRUSTED_PROXIES: ${KEYSTONE_TRUSTED_PROXIES:-}
+
+x-keystone: &keystone
+  <<: *hardening
+  image: ${KEYSTONE_IMAGE:-keystone:dev}
+  restart: unless-stopped
+  environment: *service-env
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: keystone_owner
+      POSTGRES_DB: keystone
+      POSTGRES_PASSWORD: ${PG_OWNER_PASSWORD:?}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keystone_owner -d keystone"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # The password reaches redis-server on stdin (printf is a shell builtin), never in argv/ps.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    command:
+      - sh
+      - -c
+      - >-
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" |
+        redis-server - --maxmemory-policy noeviction --appendonly yes
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis-agg:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    command:
+      - sh
+      - -c
+      - >-
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" |
+        redis-server - --maxmemory 64mb --maxmemory-policy allkeys-lru --save '' --appendonly no
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # ---- init steps (run to completion on every `up`) ----
+
+  provision:
+    <<: *hardening
+    image: ${KEYSTONE_IMAGE:-keystone:dev}
+    restart: "no"
+    command: ["python", "-m", "keystone.db.provision"]
+    environment:
+      KEYSTONE_MIGRATION_DATABASE_URL: postgresql+psycopg://keystone_owner:${PG_OWNER_PASSWORD:?}@postgres:5432/keystone
+      KEYSTONE_APP_DB_ROLE: keystone_svc
+      KEYSTONE_APP_DB_PASSWORD: ${APP_DB_PASSWORD:?}
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  opa-config:
+    <<: *hardening
+    image: ${KEYSTONE_IMAGE:-keystone:dev}
+    restart: "no"
+    user: "1000:1000"  # the OPA image's user: it must be able to read what this writes
+    command:
+      - python
+      - -m
+      - keystone.admin.opa_config
+      - --bundle-url=http://127.0.0.1:8081
+      - --public-key=/run/secrets/opa_bundle_public_key
+      - --token-env=KEYSTONE_BUNDLE_SERVICE_TOKEN
+      - --out=/config/opa.yaml
+    secrets: [opa_bundle_public_key]
+    volumes: [opaconfig:/config]
+
+  # ---- the pod: OPA sidecar + public plane + admin plane ----
+
+  opa:
+    <<: *hardening
+    image: openpolicyagent/opa:1.20.2
+    restart: unless-stopped
+    command: ["run", "--server", "--addr=127.0.0.1:8181", "--log-level=error", "-c", "/config/opa.yaml"]
+    environment:
+      KEYSTONE_BUNDLE_SERVICE_TOKEN: ${KEYSTONE_BUNDLE_SERVICE_TOKEN:?}  # expanded by OPA
+    volumes: ["opaconfig:/config:ro"]
+    ports:
+      - "${PUBLIC_BIND:-0.0.0.0}:8080:8080"  # public plane (api)
+      - "127.0.0.1:8081:8081"  # admin plane: host loopback only
+    depends_on:
+      opa-config: {condition: service_completed_successfully}
+
+  api:
+    <<: *keystone
+    network_mode: "service:opa"
+    depends_on:
+      provision: {condition: service_completed_successfully}
+      opa: {condition: service_started}
+      redis: {condition: service_healthy}
+      redis-agg: {condition: service_healthy}
+
+  admin:
+    <<: *keystone
+    network_mode: "service:opa"
+    command:
+      - uvicorn
+      - --factory
+      - keystone.admin.app:admin_app_from_env
+      - --host=0.0.0.0
+      - --port=8081
+      - --no-server-header
+      - --no-proxy-headers
+    environment:
+      <<: *service-env
+      KEYSTONE_ADMIN_BOOTSTRAP_TOKEN: ${KEYSTONE_ADMIN_BOOTSTRAP_TOKEN:-}
+      KEYSTONE_BUNDLE_SERVICE_TOKEN: ${KEYSTONE_BUNDLE_SERVICE_TOKEN:?}
+    healthcheck:
+      # Liveness: /readyz answering at all (200 ready, 503 degraded) means the process is up.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8081/readyz", timeout=2)
+          except urllib.error.HTTPError as exc:
+              sys.exit(0 if exc.code == 503 else 1)
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      provision: {condition: service_completed_successfully}
+      opa: {condition: service_started}
+      redis: {condition: service_healthy}
+
+  # ---- workers (R7: two queues, never shared) ----
+
+  worker:
+    <<: *keystone
+    command: ["celery", "-A", "keystone.workers.tasks", "worker", "-Q", "keystone-worker", "--concurrency=2", "--hostname=worker@%h"]
+    healthcheck: {disable: true}
+    depends_on:
+      provision: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  anchor:
+    <<: *keystone
+    command: ["celery", "-A", "keystone.workers.tasks", "worker", "-Q", "keystone-anchor", "--concurrency=1", "--hostname=anchor@%h"]
+    environment:
+      <<: *service-env
+      KEYSTONE_ANCHOR_KEY_PEM_PATH: /run/secrets/anchor_signing_key
+    secrets: [anchor_signing_key]
+    healthcheck: {disable: true}
+    depends_on:
+      provision: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  beat:
+    <<: *keystone
+    command: ["celery", "-A", "keystone.workers.tasks", "beat", "--schedule=/tmp/celerybeat-schedule"]
+    healthcheck: {disable: true}
+    depends_on:
+      redis: {condition: service_healthy}
+
+secrets:
+  anchor_signing_key:
+    file: ${ANCHOR_SIGNING_KEY_FILE:?path to the Ed25519 anchor key PEM (A8)}
+  opa_bundle_public_key:
+    file: ${OPA_BUNDLE_PUBLIC_KEY_FILE:?path to the bundle-signing RSA public key PEM}
+
+volumes:
+  pgdata:
+  redisdata:
+  opaconfig:

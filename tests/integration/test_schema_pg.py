@@ -1,6 +1,7 @@
 """Migration 0002 constraints enforce the spec at the database, not just in Python."""
 
 import uuid
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy import text
@@ -8,6 +9,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from keystone.db.ids import uuid7
+from keystone.db.partitions import ensure_audit_partition_as_app
 
 pytestmark = pytest.mark.integration
 
@@ -176,3 +178,40 @@ def test_app_role_cannot_delete_issuances_or_rewrite_anchors(
         conn.execute(text("UPDATE audit_anchors SET external_ref = 'x'"))
     with admin_engine.begin() as conn, pytest.raises(DBAPIError, match="append-only"):
         conn.execute(text("DELETE FROM audit_anchors"))
+
+
+def _months_from_now(months: int) -> date:
+    today = datetime.now(UTC).date()
+    index = today.year * 12 + today.month - 1 + months
+    return date(index // 12, index % 12 + 1, 1)
+
+
+def test_app_role_pre_creates_partitions_only_through_the_definer_function(
+    app_engine: Engine,
+) -> None:
+    month = _months_from_now(20)  # beyond the 14 months seeded by migration 0001
+    with app_engine.begin() as conn:
+        assert ensure_audit_partition_as_app(conn, month) is True
+        assert ensure_audit_partition_as_app(conn, month) is False  # idempotent
+    with app_engine.connect() as conn:
+        name = f"audit_events_{month.year:04d}{month.month:02d}"
+        assert conn.execute(text("SELECT to_regclass(:n)"), {"n": name}).scalar() == name
+    # Direct DDL is still refused: the function is the only door.
+    with pytest.raises(DBAPIError, match="permission denied"), app_engine.begin() as conn:
+        conn.execute(text("CREATE TABLE sneaky (id int)"))
+
+
+@pytest.mark.parametrize(
+    "month_sql",
+    [
+        "date '2001-01-01'",  # far past
+        "(date_trunc('month', now()) + interval '30 months')::date",  # beyond the window
+        "(date_trunc('month', now()) + interval '2 months' + interval '3 days')::date",
+        "NULL",
+    ],
+)
+def test_partition_function_refuses_out_of_window_or_odd_months(
+    app_engine: Engine, month_sql: str
+) -> None:
+    with pytest.raises(DBAPIError), app_engine.begin() as conn:
+        conn.execute(text(f"SELECT keystone_ensure_audit_partition({month_sql})"))

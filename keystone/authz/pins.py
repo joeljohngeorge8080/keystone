@@ -9,6 +9,7 @@ A load timeout leaves the pin unchanged (409). Rollback to a lower sequence requ
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -23,11 +24,12 @@ from sqlalchemy.engine import Connection, Engine
 
 from keystone.audit.events import AuditEventInput, EventType
 from keystone.audit.sink import AuditSink
-from keystone.authz.bundles import BundleManifest, inspect_bundle
+from keystone.authz.bundles import BundleError, BundleManifest, inspect_bundle
 from keystone.authz.service import ActivePin, active_pin
 from keystone.db.ids import uuid7
 
 DEFAULT_LOAD_TIMEOUT_SECONDS = 30.0
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
 
 
@@ -101,6 +103,11 @@ _INSERT = text(
     "VALUES (:id, :digest, :sequence, true, :forced, :pinned_by)"
 )
 _LOCK = text("SELECT pg_advisory_xact_lock(hashtext('policy_pins'))")
+_SAVE_BUNDLE = text(
+    "INSERT INTO policy_bundles (digest, bundle) VALUES (:digest, :bundle) "
+    "ON CONFLICT (digest) DO NOTHING"
+)
+_LOAD_BUNDLE = text("SELECT bundle FROM policy_bundles WHERE digest = :digest")
 _HISTORY = text(
     "SELECT p.id, p.bundle_digest, p.bundle_sequence, p.active, p.forced_rollback, "
     "p.pinned_at, a.name AS pinned_by FROM policy_pins p "
@@ -222,6 +229,9 @@ class PinActivator:
             raise PinSequenceRejected("refusing to load a bundle that could not be pinned")
 
         # ---- load phase: OPA must confirm before anything is committed ----
+        # Persisted first, so a restarted admin plane can serve the bundle OPA was told to load.
+        with self._engine.begin() as conn:
+            conn.execute(_SAVE_BUNDLE, {"digest": manifest.revision, "bundle": bundle})
         self._gateway.stage(manifest.revision, bundle)
         deadline = time.monotonic() + self._timeout
         while self._gateway.loaded_digest() != manifest.revision:
@@ -256,6 +266,27 @@ class PinActivator:
         return PinResult(pin=pin, manifest=manifest, rolled_back=rolled_back, audit_seq=seq)
 
 
+def restage_active_bundle(engine: Engine, store: StagedBundleStore) -> str | None:
+    """Boot hook: stage the active pin's persisted bundle again so OPA's polls keep succeeding.
+
+    The stored bytes are re-inspected, so a bundle whose sources no longer match its pinned
+    revision is refused (BundleError) rather than served. Returns the staged digest, or None
+    when nothing is pinned or the pin predates bundle persistence.
+    """
+    with engine.connect() as conn:
+        pin = active_pin(conn)
+        if pin is None:
+            return None
+        bundle = conn.execute(_LOAD_BUNDLE, {"digest": pin.bundle_digest}).scalar()
+    if bundle is None:
+        return None
+    manifest = inspect_bundle(bytes(bundle))
+    if manifest.revision != pin.bundle_digest:
+        raise BundleError("persisted bundle revision does not match the active pin")
+    store.put(pin.bundle_digest, bytes(bundle))
+    return pin.bundle_digest
+
+
 def opa_config_yaml(
     *,
     bundle_service_url: str,
@@ -263,17 +294,28 @@ def opa_config_yaml(
     verification_key_pem: str,
     poll_seconds: int = 5,
     bearer_token_path: str | None = None,
+    bearer_token_env: str | None = None,
 ) -> str:
     """OPA sidecar config: poll Keystone's admin plane for the bundle and verify its signature.
 
-    `bearer_token_path` points OPA at a file holding the bundle-service token, so the secret is
-    never written into the config itself."""
+    The bundle-service token is never written into the config itself: `bearer_token_path` points
+    OPA at a file holding it, or `bearer_token_env` names an environment variable OPA expands
+    when it loads the config (Ch. 48 env injection)."""
+    if bearer_token_path and bearer_token_env:
+        raise ValueError("pass bearer_token_path or bearer_token_env, not both")
+    if bearer_token_env is not None and not _ENV_NAME.match(bearer_token_env):
+        raise ValueError("bearer_token_env must be an environment variable name")
     indented_key = "\n".join("      " + line for line in verification_key_pem.strip().splitlines())
-    credentials = (
-        f"    credentials:\n      bearer:\n        token_path: {json.dumps(bearer_token_path)}\n"
-        if bearer_token_path
-        else ""
-    )
+    credentials = ""
+    if bearer_token_path:
+        credentials = "    credentials:\n      bearer:\n" + (
+            f"        token_path: {json.dumps(bearer_token_path)}\n"
+        )
+    elif bearer_token_env:
+        credentials = (
+            "    credentials:\n      bearer:\n"
+            f"        token: {json.dumps('${' + bearer_token_env + '}')}\n"
+        )
     return (
         "services:\n"
         f"  keystone:\n    url: {bundle_service_url}\n"

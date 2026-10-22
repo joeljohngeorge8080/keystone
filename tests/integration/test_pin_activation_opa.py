@@ -38,6 +38,7 @@ from keystone.authz.pins import (
     PolicyLoadTimeout,
     StagedBundleStore,
     opa_config_yaml,
+    restage_active_bundle,
 )
 from keystone.authz.service import active_pin
 
@@ -256,6 +257,52 @@ def test_two_phase_activation_rollback_and_rejections(app_engine: Engine, harnes
         assert pin is not None and pin.bundle_digest == manifest_a.revision
     loaded = httpx.get(harness.opa_url + "/v1/data/system/bundles").json()["result"]
     assert loaded["keystone"]["manifest"]["revision"] == manifest_a.revision
+
+
+def test_restarted_admin_plane_restages_the_active_pins_bundle(
+    app_engine: Engine, admin_engine: Engine, harness: Harness
+) -> None:
+    assert restage_active_bundle(app_engine, StagedBundleStore()) is None  # nothing pinned yet
+    bundle = build_signed_bundle(POLICIES, bundle_sequence=1, signing_key_pem=harness.signing_key)
+    result = _activator(app_engine, harness).activate(bundle, pinned_by=None, actor="admin:alice")
+
+    after_restart = StagedBundleStore()  # a fresh process: the in-memory stage is empty
+    assert restage_active_bundle(app_engine, after_restart) == result.pin.bundle_digest
+    assert after_restart.current() == (result.pin.bundle_digest, bundle)
+
+    # Persisted bytes are append-only: a digest's bundle can be neither rewritten nor removed.
+    with pytest.raises(Exception, match="append-only"), admin_engine.begin() as conn:
+        conn.execute(text("UPDATE policy_bundles SET bundle = '\\x00'"))
+    with pytest.raises(Exception, match="append-only"), admin_engine.begin() as conn:
+        conn.execute(text("DELETE FROM policy_bundles"))
+
+
+def test_restage_refuses_bytes_that_do_not_prove_the_pinned_revision(
+    app_engine: Engine, admin_engine: Engine, harness: Harness
+) -> None:
+    # A pin whose persisted bytes are a different (validly signed) bundle is never served.
+    other = build_signed_bundle(
+        _variant_policies(harness.tmp, "policies_r", "1300"),
+        bundle_sequence=1,
+        signing_key_pem=harness.signing_key,
+    )
+    pinned = policy_source_digest(POLICIES)
+    with admin_engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO policy_bundles (digest, bundle) VALUES (:d, :b)"),
+            {"d": pinned, "b": other},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO policy_pins (id, bundle_digest, bundle_sequence, active) "
+                "VALUES (gen_random_uuid(), :d, 1, true)"
+            ),
+            {"d": pinned},
+        )
+    store = StagedBundleStore()
+    with pytest.raises(BundleError, match="does not match the active pin"):
+        restage_active_bundle(app_engine, store)
+    assert store.current() is None
 
 
 def test_bundle_inspection_refuses_unsigned_relabelled_or_unsequenced(

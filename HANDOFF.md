@@ -1,7 +1,7 @@
 # HANDOFF.md — Keystone implementation
 
-> For the next engineer (or model) picking this up. State as of **2026-10-22**, last commit
-> `293ad20` plus the uncommitted admin slice 2 described below.
+> For the next engineer (or model) picking this up. State as of **2026-10-23**: last commit
+> `427baac`, plus the uncommitted Phase 5 completion and Phase 6 work described below.
 > The design of record is the frozen spec in the Obsidian vault
 > (`~/Documents/Obsidian Vault/keystone/docs/05-corrections-round2-R1-R9-FINAL.md`); that
 > file's anchor list wins over anything here. `STATUS.md` in this repo is the per-phase
@@ -10,17 +10,16 @@
 ## Status in one paragraph
 
 Every security core the two audit rounds reopened is implemented with a structural mechanism
-and a named test. The public plane serves `POST /v1/credentials` end to end: Tier 0 shedding,
-OIDC verification with one-time JTIs, Tier 1 limits, the anchor breaker (R7), the OPA
-authorization stage with pin-divergence checks, the STS in-flight cap, audit-before-mint, and
-single-shot delivery. The admin plane is feature-complete against spec Ch. 40: bearer-token
-auth with an env bootstrap, `/readyz`, policy pins with the OPA bundle route, roles and
-session-policy templates, revocations, and the read routes (decisions, audit events, audit
-verify, issuances). **385 tests pass; `ruff`, `ruff format` and `mypy --strict` are clean.**
-Roughly **70% of the 640-hour budget** is spent (estimate, not measured). What remains is the
-operator CLI, deployment (compose and Terraform, including the IAM half of the double
-allowlist), the GitHub Action, CI bundle signing with the real key, and the dashboard,
-metrics and Phase 6 hardening.
+and a named test, and the system now deploys: a non-root, read-only Docker image, a compose
+stack (OPA sidecar sharing a network namespace with both planes, two Celery queues + beat, two
+Redis instances, provisioning and OPA-config init steps) smoke-tested live, Terraform modules for
+the IAM half of the double allowlist (validated and guardrail-tested offline, never applied),
+the operator CLI, and the `keystone-auth` GitHub Action. Phase 6 has the Ch. 27 failure matrix,
+mutation testing at 100% on chain + verifier (a CI gate), the hostile policy matrix (R2) and
+stage-latency budgets. **505 tests pass (+4 opt-in perf); `ruff`, `ruff format`, `mypy --strict`
+and `actionlint` are clean.** Not done: metrics and dashboard (blocked on approving new
+dependencies), retention pruning (blocked on a design decision), the load/soak harness, and
+anything that needs real AWS or GitHub to run.
 
 ## Where things are
 
@@ -59,13 +58,37 @@ Required settings: `KEYSTONE_DATABASE_URL`, `KEYSTONE_REDIS_URL`, `KEYSTONE_AWS_
 `KEYSTONE_ADMIN_BOOTSTRAP_TOKEN` (registered once, while no admin principal exists, 24 h) and
 `KEYSTONE_BUNDLE_SERVICE_TOKEN` (the OPA sidecar's bearer for the bundle route).
 
-Useful CLI entry points (the operator CLI is still partial):
+Deploy the whole stack (Ch. 62/63):
 
 ```bash
-uv run keystone audit verify            # online chain verification
+docker build -t keystone:dev .
+cp deploy/.env.example deploy/.env      # fill in; keys go in deploy/secrets/ (both gitignored)
+docker compose -f deploy/compose.yml --env-file deploy/.env up -d
+```
+
+Operator CLI (talks to the admin plane; token from env or file, never argv):
+
+```bash
+export KEYSTONE_ADMIN_URL=https://admin.internal:8081   # plain http only for a loopback tunnel
+export KEYSTONE_ADMIN_TOKEN_FILE=~/.keystone-token       # or KEYSTONE_ADMIN_TOKEN
+uv run keystone policy status           # exit 1 on no pin / divergence
+uv run keystone policy pin bundle.tar.gz
+uv run keystone roles list | decisions tail -f | tokens issue --principal alice
+uv run keystone replay <decision-id> --bundle b.tar.gz --input input.json
+uv run keystone audit verify            # direct to PostgreSQL (KEYSTONE_DATABASE_URL)
 uv run keystone audit export > c.jsonl  # offline bundle; then: keystone audit verify --offline c.jsonl
-uv run keystone-policy-verify policies  # R2 structural validator (exit 0 / 1 / 2)
+```
+
+Policy and Phase 6 gates:
+
+```bash
+uv run keystone-policy-verify policies                                   # R2 structural validator
+uv run python -m keystone.authz.policy_verify.hostile policies --seeds tests/policy/hostile_seeds.json
 opa test --coverage --threshold 100 policies
+uv run python -m tests.mutation.run                                      # >= 95% or exit 1
+KEYSTONE_RUN_PERF=1 uv run pytest tests/perf -s                          # Ch. 61 stage budgets
+# Terraform (no binary needed locally):
+docker run --rm -v $PWD/deploy/terraform:/tf -w /tf/modules/broker-runtime hashicorp/terraform:1.10.5 test
 ```
 
 Integration tests recreate the schema per test (`DROP SCHEMA public CASCADE` + Alembic
@@ -93,9 +116,17 @@ keystone/broker/     connectors/{base,aws_sts}, ttl, issuance (state machine, pa
                      (T1/mint/T2), reconcile (R6), revocation (F6)
 keystone/registry/   models, repo (reads, writes), admin (audited role and template changes)
 keystone/db/         ids (UUIDv7), redis (fail-closed guard), partitions, migrations/0001..0003
-keystone/workers/    celery_app (two queues), tasks (thin bodies)
+keystone/workers/    celery_app (two queues), tasks (thin bodies; JSON logging via setup_logging)
 keystone/config/     settings (env > defaults; KEYSTONE_TEST_* reserved; SecretStr secrets)
-cli/keystone_cli/    `keystone audit verify|export`
+keystone/telemetry/  clock (adjtimex sync signal), logs (JSON lines, denylist, request/decision ids)
+keystone/db/         + provision (deploy init: migrate, partitions, service login role)
+keystone/admin/      + opa_config (deploy init: render the OPA sidecar config)
+keystone/authz/      + build_bundle (CI entry point), policy_verify/hostile (R2 hostile matrix)
+cli/keystone_cli/    main, client (admin HTTP, TLS rule, token sources), output (safe tables),
+                     admin (roles/policy/decisions/audit tail/revoke/tokens), replay
+action/              keystone-auth composite Action (stdlib Python, 3.10+)
+deploy/              compose.yml (+ .env.example), compose.test.yml, terraform/{modules,environments}
+tests/mutation/      stdlib AST mutation harness; tests/perf/ stage budgets (opt-in)
 policies/            reference bundle keystone.authz -> keystone.grants.* -> keystone.lib (+ opa tests)
 ```
 
@@ -122,6 +153,14 @@ policies/            reference bundle keystone.authz -> keystone.grants.* -> key
 | Reconciler atomicity + lag (R6) | one txn per row; `indeterminate` until 20 min window | `test_reconciler_pg` |
 | Worker isolation (R7) | dedicated `keystone-anchor` queue | `test_workers` |
 | Reconciler append-only (R9) | reconcilers only `INSERT` audit rows; DB trigger blocks UPDATE/DELETE | `test_audit_chain_pg`, `test_schema_pg` |
+| Every dependency outage fails closed with Retry-After (Ch. 27) | one error table; PG/Redis/OPA/JWKS/STS/anchor rows | `test_failure_matrix` |
+| Verifier catches what it claims to | mutation score gate on chain/verify/canonical | `python -m tests.mutation.run` (CI) |
+| Hostile inputs never allowed (R2) | generated absent/wrong-type/fork/org/ref/near-miss matrix per grant seed | `test_hostile_matrix`, policy-bundle CI stage |
+| App role creates partitions only via the definer function | migration 0005; no CREATE on schema | `test_schema_pg`, `test_provision_pg` |
+| Persisted bundle re-proven before it is served | `restage_active_bundle` re-inspects bytes vs pin | `test_pin_activation_opa` |
+| Owner DB URL can never reach a service | provisioning variables are not settings: services refuse to boot | `test_provision_pg` |
+| Credentials masked before export (Action) | `::add-mask::` first; heredoc exports with random delimiters | `test_keystone_action` |
+| Hostile claim text cannot drive the terminal (CLI) | control/bidi characters escaped in every cell | `test_cli_client`, `test_cli_admin` |
 
 ## Decisions taken during implementation (not in the spec; do not silently reverse)
 
@@ -142,25 +181,38 @@ policies/            reference bundle keystone.authz -> keystone.grants.* -> key
 - **ISSUED rows never marked delivered** are closed as DELIVERED by the reconciler with an `issued_undelivered` event after a 5 min grace.
 - **JCS integer domain**: ints above 2^53−1 are refused by `rfc8785`.
 - Product-owner defaults accepted: mechanism-3 revocation **OFF**, anchor breaker **600 s**, retention **400 days / monthly partitions**.
+- **Staged bundles persist in `policy_bundles`** (append-only, migration 0004), not on disk: the image's rootfs is read-only and the DB is the backed-up, shared store.
+- **Compose secrets are env-injected** (Ch. 48 says so); only the two key files are mounted. Compose's env-sourced `secrets:` are copied into containers, which a read-only rootfs refuses.
+- **OPA, api and admin share one network namespace** in compose so the Ch. 21 "OPA on localhost" rule holds; admin is published on host loopback only.
+- **Overrides apply to the repository bucket only**; `role` rows are not applied (no per-role bucket exists in Ch. 29).
+- **`replay` takes the policy input from the operator** and proves it against `input_hash`; the audit record deliberately does not store full inputs.
+- **Mutation testing is a stdlib harness**, not `mutmut` (no new dependency); equivalent mutants are listed with a reason in `tests/mutation/run.py`.
+- **Terraform target ARNs are built from names** in the root module, avoiding a broker-allowlist <-> trust-policy dependency cycle.
 
 ## What to do next (in order)
 
-1. **Commit the admin slice 2 work** if it is still uncommitted (see `git status`).
-2. **CLI admin commands** (Ch. 45): `roles`, `policy {status,pin,history}`, `decisions {get,tail}`, `revoke role`, `tokens`, `audit {verify,export,tail}`; tables plus `--json`, exit codes 0/1/2, token from env, never argv. They call the admin routes above.
-3. **Deploy**: compose (api, admin, worker, anchor worker, opa sidecar with `opa_config_yaml`, PostgreSQL, `noeviction` Redis plus a separate `allkeys-lru` aggregation Redis), Terraform modules (Ch. 64): broker runtime IAM allowlist and target-role trust policy. The IAM half of the double allowlist is still only a contract.
-4. **CI**: switch `policy-bundle.yml` to `build_signed_bundle` with the OPA signing key from secrets; exercise the Cosign step (still UNVERIFIED).
-5. **GitHub Action** (Ch. 46): `keystone-auth@v1`, masking before any output.
-6. **Phase 6**: Ch. 27 failure matrix as one table-driven suite, mutation testing on chain and verifier, k6 budgets (Ch. 61).
-7. **Smaller owed items**: OPA capabilities file (Ch. 19), retention pruning (`DROP PARTITION` only behind an anchor), partition pre-creation in production, hostile-matrix generator for grants, dashboard (Ch. 44), metrics (Ch. 51), structured logging (Ch. 49), `/readyz` clock-sync signal.
+1. **Commit** the uncommitted Phase 5/6 work (see `git status`; graphify-out/ stays uncommitted).
+2. **Decide**: approve `prometheus_client` (metrics, Ch. 51) and a templating library (dashboard,
+   Ch. 44), or choose alternatives; then build them.
+3. **Decide retention restart semantics** (Ch. 33 says prune only behind an anchor, but every
+   verifier starts from genesis or the previous row): e.g. verification resumes from the newest
+   anchor at or before the first retained seq, with `prev_hash` taken from that anchor's head.
+   Then implement `DROP PARTITION` behind it through a definer function like migration 0005's.
+4. **Exercise against real infrastructure**: set the `OPA_BUNDLE_SIGNING_KEY` secret and run the
+   bundle workflow (and its Cosign step); `terraform apply` the example root in a sandbox account;
+   run `action/` from a real workflow; add the nightly sandbox-AWS job (Ch. 59).
+5. **Load/soak harness** (Ch. 61): needs a fake STS + local JWKS issuance path, then k6/Locust.
+6. **Smaller owed items**: OPA capabilities file (Ch. 19), decision-lookup index, tracing (Ch. 52),
+   image signing + SBOM (Ch. 63), Trivy/pip-audit (Ch. 60), Action release tags + SLSA.
 
 ## Known sharp edges
 
-- **Staged bundle lives in admin-process memory.** After an admin restart OPA's polls get 404 until the next pin. OPA keeps its loaded bundle, but an OPA restart inside that window is a fail-closed outage. Persist the staged bundle or re-stage on boot.
-- **Audit partitions are created by the migration only** (14 months from the month it runs). Inserts outside a partition fail closed. Production needs a pre-creation job; the test fixture now creates the pinned month explicitly.
-- **Rate-limit overrides don't line up.** The `rate_limit_overrides` table uses scopes `repository|role`, but `Tier1Limiter` asks for `identity|repository`, so overrides never apply for identities. Fix before relying on overrides.
-- **`source_ip` is the direct peer address.** No trusted-proxy handling yet; behind a load balancer every request shares one IP in the policy input.
+- **Pins made before migration 0004 have no persisted bundle**: the admin plane logs a warning at boot and OPA polls 404 until the next pin.
+- **Restarting the `opa` container breaks `api`/`admin` networking** (they live in its namespace); restart all three together.
+- **Partition pre-creation depends on beat** running `ensure_partitions` daily (as the service role, via the definer function).
+- **Rate-limit `role`-scope override rows are ignored** (see decisions).
+- **`KEYSTONE_TRUSTED_PROXIES` must list the load balancers**, or every request behind one shares its address in the policy input.
 - **Decision lookup has no index** on `details->'data'->>'decision_id'`. It is bounded by the UUIDv7 timestamp so PostgreSQL prunes older partitions; add an index by migration if it gets slow.
-- **`/readyz` doesn't probe clock sync** (spec Ch. 31 wants a desync signal).
 - SQLAlchemy `text()` treats `:word` and `::cast` inside raw DDL as bind parameters: escape with `\:` or use `CAST(...)`.
 - PostgreSQL regex repetition counts are capped at 255 (`{1,512}` is an error).
 - `opa build -b <absolute path>` records absolute member names; build from `cwd` with `-b .`.

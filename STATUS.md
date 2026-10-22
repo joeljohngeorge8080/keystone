@@ -1,6 +1,6 @@
 # STATUS.md — implementation progress against HANDOFF phases
 
-Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINAL.md`.
+Updated 2026-10-23. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINAL.md`.
 
 ## Phase 1 — Audit chain (R1) — DONE, VERIFIED
 - [x] `audit_events` (month-partitioned, append-only via grants + trigger), `audit_chain_head`
@@ -13,13 +13,15 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
 - [ ] `audit_anchors` table, Ed25519 anchor signing, S3 Object Lock mirror, anchor-signature
       verification in `/verify` (Phase 4, R7 `keystone-anchor` worker)
 - [ ] Scheduled verification task + issuance breaker on anchor-store unreachability (Phase 4)
-- [ ] Partition pre-creation beyond the 14 months seeded by migration 0001 and retention
-      DROP PARTITION (Phase 4 retention worker) — inserts outside a partition fail closed
-- [ ] `GET /v1/audit/events`, `/v1/audit/verify`, `/v1/decisions/{id}` HTTP surface (Phase 5)
+- [x] Partition pre-creation: migration 0005 `keystone_ensure_audit_partition` (SECURITY DEFINER,
+      bounded window) so the least-privilege worker can create months ahead (it could not before)
+- [ ] Retention DROP PARTITION — BLOCKED on a design decision: the spec says "prune only behind an
+      anchor" but not how verification restarts after a pruned prefix (see HANDOFF)
+- [x] `GET /v1/audit/events`, `/v1/audit/verify`, `/v1/decisions/{id}` HTTP surface (Phase 5)
 - [ ] `audit verify --offline` reading `pg_dump` + S3 anchors (Ch. 33) — current offline mode
       reads the JSONL produced by `audit export`; pg_dump input deferred to Phase 4 with anchors
-- [ ] Mutation testing on chain + verifier (Ch. 57) — Phase 6
-- [ ] Admin-plane commands `roles`, `policy`, `decisions`, `revoke`, `replay`, `tokens` (Ch. 45)
+- [x] Mutation testing on chain + verifier (Ch. 57) — Phase 6
+- [x] Admin-plane commands `roles`, `policy`, `decisions`, `revoke`, `replay`, `tokens` (Ch. 45)
 
 ## Phase 2 — Policy validator `keystone-policy-verify` (R2) — DONE, VERIFIED
 - [x] Parses via `opa parse` AST (no second Rego parser); transitive call graph from
@@ -34,9 +36,9 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       `opa build` → Cosign keyless sign; signing is unreachable unless the validator passed
 
 ### Deliberately NOT done in Phase 2
-- [ ] Hostile-matrix generator (claim-absent / wrong-type / fork / wrong-org permutations
-      auto-generated per referenced claim) — R2 requires it alongside the validator before
-      signing; reference policy covers these cases by hand in `authz_test.rego` for now
+- [x] Hostile-matrix generator (`keystone.authz.policy_verify.hostile`): absent / wrong-type per
+      referenced claim + fork / wrong-org / mutated-ref / near-miss repo; seeds per grant
+      (`tests/policy/hostile_seeds.json`, an unseeded grant fails); required CI stage before signing
 - [ ] Cosign keyless step is written but UNVERIFIED locally (needs GitHub OIDC)
 - [ ] OPA capabilities file disabling non-deterministic builtins (Ch. 19) — Phase 4 with sidecar
 - [ ] Validator treats `deny*`-named rules as exempt only when never used as an allow condition;
@@ -60,13 +62,15 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
 - [x] Settings (Ch. 47): env > defaults, unknown KEYSTONE_* keys refuse boot
 
 ### Deliberately NOT done in Phase 3
-- [ ] Revocation mechanisms 2-4 (Ch. 26 / F6 ordering, `keystone revoke role`) — Phase 5
-- [ ] Policy-pin repository + two-phase activation (R5) and admin-token auth — Phase 4/5
-- [ ] Startup issuance reconciler (R6) that resolves AUTHORIZED/INDETERMINATE rows — Phase 5
-- [ ] Terraform modules (Ch. 64): broker-runtime IAM allowlist, target-role trust policy — the IAM
-      half of the double allowlist exists only as a contract right now
+- [x] Revocation mechanisms 2-4 (Ch. 26 / F6 ordering, `keystone revoke role`) — Phase 5
+- [x] Policy-pin repository + two-phase activation (R5) and admin-token auth — Phase 4/5
+- [x] Startup issuance reconciler (R6) that resolves AUTHORIZED/INDETERMINATE rows — Phase 5
+- [x] Terraform modules (Ch. 64) in `deploy/terraform/`: broker-runtime (exact allowlist + Deny
+      NotResource), target-role (trust needs `ks-*` session + keystone tags; mechanism-3 flag off),
+      anchor-bucket (Object Lock COMPLIANCE 400 d), network; `terraform validate` + 11 mock-provider
+      `terraform test` guardrail runs pass. Never applied against a real account (UNVERIFIED in AWS)
 - [ ] STS verified against moto + botocore Stubber only; no nightly sandbox-AWS run yet (Ch. 59)
-- [ ] `POST /v1/credentials` and the OIDC verification stage that produces IdentityContext (Phase 4/5)
+- [x] `POST /v1/credentials` and the OIDC verification stage that produces IdentityContext (Phase 4/5)
 - [ ] `updated_at` maintenance is app-side; no DB trigger
 
 ## Phase 4 — OPA + rate limiting + worker isolation — DONE (core), VERIFIED
@@ -89,16 +93,18 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
 
 ### Deliberately NOT done in Phase 4
 - [ ] OPA capabilities file disabling non-deterministic builtins (Ch. 19)
-- [ ] Bundle-server endpoint on the admin plane (StagedBundleStore exists; HTTP route is Phase 5)
-- [ ] policy-bundle.yml still builds with `opa build -b policies` + Cosign; switch to
-      `build_signed_bundle` (content-digest revision, OPA signing key from CI secrets)
-- [ ] Redis `noeviction` for primary and a separate `allkeys-lru` instance for aggregation are
-      documented, not yet expressed in compose/Terraform
+- [x] Bundle-server endpoint on the admin plane; staged bundle persisted (migration 0004) and
+      re-staged on boot, verified live across admin + OPA restarts
+- [x] policy-bundle.yml builds via `python -m keystone.authz.build_bundle` (content-digest
+      revision — the old git-SHA revision could never be pinned — OPA key from the
+      `OPA_BUNDLE_SIGNING_KEY` secret via env). UNVERIFIED on GitHub: needs that secret; Cosign
+      keyless step still unexercised
+- [x] Redis `noeviction` primary + separate `allkeys-lru` aggregation instance in `deploy/compose.yml`
 - [ ] Retention pruning (DROP PARTITION only behind an anchor) and JWKS/aggregation task wiring
       have bodies but no end-to-end worker run
 - [ ] S3 conditional put (`IfNoneMatch: *`) is on by default but only moto-tested without it
 
-## Phase 5 — Reconcilers + API/CLI — reconcilers DONE, public API DONE, admin plane DONE
+## Phase 5 — Reconcilers + API/CLI + deploy — DONE except metrics/dashboard (blocked on deps)
 - [x] Issuance reconciler (R6): one transaction per row, `indeterminate` until the 20 min
       CloudTrail window passes, `issued_undelivered` when a session is found, never rewrites
 - [x] Revocation (Ch. 26, F6): flagged -> IAM deny policy -> read-back confirm -> applied;
@@ -121,20 +127,36 @@ Updated 2026-09-19. Spec of record: vault `docs/05-corrections-round2-R1-R9-FINA
       `GET /v1/decisions/{id}` (decision + outcome events), `GET /v1/audit/events` (keyset,
       event_type filter), `GET /v1/audit/verify` (snapshot head, 100k events per call),
       `GET /v1/issuances` (UUIDv7 keyset, state filter). Events render from `canonical_payload`.
-- [ ] Decision lookup scans `details->'data'->>'decision_id'` with an occurred_at bound derived
-      from the UUIDv7 (partition pruning) but no expression index; add one by migration if slow
-- [ ] Rate-limit overrides from `rate_limit_overrides` (Tier1Limiter runs on defaults; note the
-      table's scopes are `repository|role` while the limiter asks for `identity|repository`),
-      trusted proxy handling for `source_ip`, structured JSON logging (Ch. 49), `/readyz` clock
-      sync (NTP) signal
-- [ ] The staged bundle lives in admin-process memory: after an admin restart OPA's polls get
-      404 (it keeps its loaded bundle) until the next pin; persist or re-stage on boot
-- [ ] CLI admin commands (`roles`, `policy pin/status`, `decisions`, `revoke role`, `replay`)
-- [ ] Dashboard (Ch. 44), GitHub Action (Ch. 46), metrics (Ch. 51), Docker/compose, Terraform
+- [x] Fail-closed gaps closed: PostgreSQL loss on the public path was a 500, now 503
+      `KEYSTONE_DEPENDENCY_UNAVAILABLE`; every 503 now carries `Retry-After` (Ch. 27)
+- [x] Rate-limit overrides wired from `rate_limit_overrides` (repository scope; the table has no
+      identity scope); `per_minute = 0` blocks without the old divide-by-zero in Lua
+- [x] Trusted-proxy `source_ip` (`KEYSTONE_TRUSTED_PROXIES`, off by default; uvicorn run with
+      `--no-proxy-headers`), `/readyz` clock-sync check (kernel adjtimex, Ch. 31), structured JSON
+      logging with a field denylist and message-free exception frames (Ch. 49)
+- [x] Operator CLI (Ch. 45): `roles`, `policy {status,pin,history}`, `decisions {get,tail}`,
+      `audit {verify,export,tail}`, `revoke role`, `replay`, `tokens`; tables + `--json`; 0/1/2;
+      token from env/file only; terminal-escape-safe output. `replay` needs the decision's input
+      (`--input`, proven against the recorded `input_hash`). Keychain storage not done (needs a dep)
+- [x] Docker image (non-root, read-only rootfs, locked venv) + `deploy/compose.yml` (OPA/api/admin
+      share a netns; two queues + beat; provision + opa-config init steps); smoke-tested live:
+      provision, pin via CLI, OPA reload after admin+OPA restarts, partition task as service role
+- [x] GitHub Action `action/` (Ch. 46): mask first, fresh OIDC token per retry, 2/4/8 s on 429/503,
+      heredoc exports. UNVERIFIED on a real runner; release tagging/SLSA/Cosign not done
+- [ ] Decision lookup has no expression index on `details->'data'->>'decision_id'` (add if slow)
+- [ ] Metrics (Ch. 51) — needs `prometheus_client` (new dependency: awaiting approval)
+- [ ] Dashboard (Ch. 44) — needs a templating library (new dependency: awaiting approval)
+- [ ] Tracing (Ch. 52), image signing/SBOM (Ch. 63), Trivy/pip-audit in CI (Ch. 60)
 
-## Phase 6 — Invariant test suite — partial
-- [x] Named tests exist for: fail-closed on PostgreSQL/Redis/OPA/JWKS outage, canonical-payload,
-      structural policy validation, double-allowlist DB half, audit-before-mint, revocation
-      ordering, replay, rate limiting, pin ordering, reconciler atomicity, worker isolation,
-      anchor tamper detection
-- [ ] Ch. 27 failure-table coverage as one matrix; mutation testing; performance budgets (Ch. 61)
+## Phase 6 — Invariant test suite — DONE except load/soak
+- [x] Ch. 27 failure table as one matrix (`tests/integration/test_failure_matrix.py`): OPA, PG,
+      Redis, STS, JWKS cold/warm/expired, Celery worker, anchor store; 503 + Retry-After + no mint
+- [x] Mutation testing (`python -m tests.mutation.run`, stdlib AST mutator, CI gate >= 95%): 100%
+      (71/71) on chain + verifier + canonical after closing 4 test gaps (forged head hash with the
+      right seq, non-object canonical payload, container/type comparisons, equal booleans)
+- [x] Ch. 61 stage budgets (`KEYSTONE_RUN_PERF=1 pytest tests/perf -s`): p95 verify 0.24 ms,
+      OPA 0.73 ms, audit commit 1.38 ms; chain-head ceiling ~630 appends/s at 16 writers (burst
+      target needs ~400) — single dev machine, not a CI baseline
+- [ ] Poisson 50 rps / burst 200 rps load harness, 24 h soak, p95 regression gate (k6 not installed;
+      needs a fake STS + local JWKS issuance path)
+- [ ] Nightly sandbox-AWS job (Ch. 59) for trust-policy correctness
